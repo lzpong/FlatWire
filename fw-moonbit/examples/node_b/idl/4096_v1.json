@@ -1,0 +1,46 @@
+{
+  "service": {
+    "name": "VehicleStateService",
+    "svc_id": 4096,
+    "major_ver": 1,
+    "minor_ver": 0,
+    "interfaces": [
+      { "name": "GetState",     "if_id": 1,     "type": "rpc",   "transport": "tcp", "input": [], "output": "VehicleState" },
+      { "name": "UpdateState",  "if_id": 2,     "type": "ff",    "transport": "tcp", "input": ["VehicleState"] },
+      { "name": "UploadBlob",   "if_id": 3,     "type": "ff",    "transport": "tcp", "input": ["Blob"], "max_payload": 1048576 },
+      { "name": "StateChanged", "if_id": 32769, "type": "event", "transport": "udp", "output": "VehicleState", "reliable": false },
+      { "name": "PowerModeChanged", "if_id": 32770, "type": "event", "transport": "udp", "output": "PowerMode", "reliable": false }
+    ],
+    "event_groups": [
+      { "name": "VehicleStateGroup", "grp_id": 1, "members": [32769, 32770] }
+    ]
+  },
+  "type_def": {
+    "structs": {
+      "VehicleState": [
+        { "name": "veh_md",     "type": "unsigned", "size": 1 },
+        { "name": "usg_md",     "type": "unsigned", "size": 1 },
+        { "name": "sys_pwr_md", "type": "signed",   "size": 1 },
+        { "name": "timestamp",  "type": "timestamp" },
+        { "name": "timestr",    "type": "string",   "fixed_len": 20 },
+        { "name": "status_msg", "type": "string",   "max_len": 64 },
+        { "name": "diag_note",  "type": "string",   "max_len": 32, "optional": true },
+        { "name": "ratio",      "type": "float",    "width": 64 }
+      ],
+      "Blob": [
+        { "name": "vin",     "type": "bytes", "fixed_len": 17 },
+        { "name": "payload", "type": "bytes", "max_len": 64000 }
+      ]
+    },
+    "enums": {
+      "PowerMode": {
+        "type": "unsigned", "size": 1,
+        "values": { "Off": 0, "Accessory": 1, "Run": 2, "CrankRequest": 3 }
+      }
+    },
+    "arrays": {
+      "VehicleStateArray":  { "type": "array", "fixed_len": 10, "element_type": "VehicleState" },
+      "VehicleStateArray2": { "type": "array", "max_len": 100,  "element_type": "VehicleState" }
+    }
+  }
+}

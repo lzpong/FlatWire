@@ -1,0 +1,3 @@
+fw-c/build/
+*.o
+fw-moonbit/_build/

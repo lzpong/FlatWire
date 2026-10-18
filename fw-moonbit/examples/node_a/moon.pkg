@@ -1,0 +1,8 @@
+import {
+  "flatwire/fw/src/codec",
+  "flatwire/fw/src/stack",
+}
+
+options(
+  "is-main": true,
+)

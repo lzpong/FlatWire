@@ -1,0 +1,16 @@
+{
+  "name": "fw-nodejs",
+  "version": "4.4.0",
+  "description": "FlatWire Protocol (FW) v4.4 协议栈 —— JavaScript/Node.js 实现（零第三方依赖）",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "src/stack.js",
+  "scripts": {
+    "test": "node --test test/",
+    "example:node-a": "node examples/node-a.js",
+    "example:node-b": "node examples/node-b.js"
+  },
+  "license": "MIT"
+}
