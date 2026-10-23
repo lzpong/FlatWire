@@ -1,3 +1,10 @@
+build/
 fw-c/build/
-*.o
+fw-nodejs/build/
+fw-moonbit/build/
 fw-moonbit/_build/
+*.o
+.old
+.vscode/
+.vs/
+.trae/

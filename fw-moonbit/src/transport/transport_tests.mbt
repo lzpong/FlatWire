@@ -1,4 +1,4 @@
-﻿﻿﻿﻿// transport 包测试：仅覆盖纯函数（RST 构造 / Ping 帧）。
+﻿// transport 包测试：仅覆盖纯函数（RST 构造 / Ping 帧）。
 // 真 socket 收发 / 心跳 / 重连等异步行为在集成冒烟脚本验证——
 // moon test 为同步执行块，无法等待 node 事件循环回调，busy-wait 会阻塞事件循环。
 

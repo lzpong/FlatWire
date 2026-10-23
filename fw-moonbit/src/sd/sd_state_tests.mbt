@@ -1,4 +1,4 @@
-﻿﻿﻿﻿// SD 状态机 inline 测试（同包访问 priv 字段：发现缓存 / 服务端订阅表 / tick 推进）
+﻿// SD 状态机 inline 测试（同包访问 priv 字段：发现缓存 / 服务端订阅表 / tick 推进）
 //
 // Transport::new / IdlStore::new / CtrlStrmPool::new 均为纯构造（无 FFI 副作用），
 // tick 与收包处理不涉及真实网络——状态迁移可在 moon test 环境完整验证

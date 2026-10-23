@@ -1,4 +1,4 @@
-﻿﻿﻿﻿// RPC 层 inline 测试（同包访问 priv 字段：pending / cons / resp_cache / ff_seen）
+﻿// RPC 层 inline 测试（同包访问 priv 字段：pending / cons / resp_cache / ff_seen）
 //
 // Transport::new / DataStrmPool::new 均为纯构造（无 FFI 副作用）；
 // 未调用 start 时 globalThis.__fw 未初始化 → 发送静默跳过（发送方尽力而为语义），
