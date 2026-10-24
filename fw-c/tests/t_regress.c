@@ -35,7 +35,7 @@ static const char *IDL_TEXT =
 "{\"name\":\"Chg\",\"if_id\":32769,\"type\":\"event\",\"transport\":\"udp\",\"output\":\"State\",\"reliable\":false}"
 "]},"
 "\"type_def\":{\"structs\":{\"State\":["
-"{\"name\":\"a\",\"type\":\"unsigned\",\"size\":2},"
+"{\"name\":\"a\",\"type\":\"u16\"},"
 "{\"name\":\"msg\",\"type\":\"string\",\"max_len\":16}"
 "]}}}";
 
@@ -47,7 +47,7 @@ static const char *IDL_TEXT_V2 =
 "{\"name\":\"Get\",\"if_id\":1,\"type\":\"rpc\",\"transport\":\"tcp\",\"input\":[],\"output\":\"State\"}"
 "]},"
 "\"type_def\":{\"structs\":{\"State\":["
-"{\"name\":\"a\",\"type\":\"unsigned\",\"size\":2},"
+"{\"name\":\"a\",\"type\":\"u16\"},"
 "{\"name\":\"msg\",\"type\":\"string\",\"max_len\":16}"
 "]}}}";
 
@@ -59,7 +59,7 @@ static const char *IDL_TEXT_5200 =
 "{\"name\":\"Get\",\"if_id\":1,\"type\":\"rpc\",\"transport\":\"tcp\",\"input\":[],\"output\":\"State\"}"
 "]},"
 "\"type_def\":{\"structs\":{\"State\":["
-"{\"name\":\"a\",\"type\":\"unsigned\",\"size\":2},"
+"{\"name\":\"a\",\"type\":\"u16\"},"
 "{\"name\":\"msg\",\"type\":\"string\",\"max_len\":16}"
 "]}}}";
 

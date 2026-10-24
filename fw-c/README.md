@@ -1,6 +1,6 @@
-# fw-c —— FlatWire Protocol (FW) v4.4 协议栈（C 语言实现）
+# fw-c —— FlatWire Protocol (FW) v5.0 协议栈（C 语言实现）
 
-FlatWire Protocol v4.4 车辆软件 RPC/事件推送协议栈的 C11 跨平台实现。
+FlatWire Protocol v5.0（裸字节编码）车辆软件 RPC/事件推送协议栈的 C11 跨平台实现。
 
 - **C11**（`-std=c11`）：MSVC VS2019+ / GCC / Clang 均可编译；**零第三方依赖**
 - **单线程非阻塞事件循环**（poll/WSAPoll 平台封装），无多线程/锁
@@ -85,7 +85,7 @@ fw-c/
 | §7 SD | 四操作 Entry（Offer 6B/Find 4B/Subscribe 7B/GetIDL 3B）、Offer 拆帧、Find 响应、状态机、自动重订阅 | `sd/entries.c` + `sd/discovery.c` |
 | §7.2 GetIDL | 仅 TCP 单播、双角色统一触发、落盘持久化、Payload≠3B→0x20、无定义→0x24 | `sd/discovery.c` + `idlstore/store.c` |
 | §8 事件 | Subscribe(CON/NON)、ACK(0x10)/ACK(0x00)、全量推送、tcp-event 预建连接、逐 Entry 处理 | `sd/discovery.c` + `events/events.c` |
-| §9 编解码 | 恒定宽度（low4==size 校验位）、CRC-16/CCITT-FALSE、null 仅 optional、fixed_len 空位 0x00、末尾新增字段容忍、MSK-XOR | `codec/codec.c` + `codec/crc.c` |
+| §9 编解码 | 裸字节：类型白名单（u8~u64/i8~i64/f32/f64/bool/timestamp 6B/enum base）、fixed_len 无前缀、max_len 前缀宽 1/2/4B、全字段必填（无 optional）、CRC 缺省关闭（接口 `crc: true` 开启）、末尾新增字段容忍、MSK-XOR | `codec/codec.c` + `codec/crc.c` |
 | §10 MSK | 先 CRC 后 XOR、控制帧禁 MSK | `codec/codec.c` + `frame/frame.c` |
 | §11.1 IDL | 纯动态加载、type_def 三处定义、transport 绑定、事件组、损坏文件跳过 | `codec/schema.c` + `idlstore/store.c` |
 | §12 错误码 | 两层两码：帧级 0x23（仅 UDP）/ IDL 级 0x20；RST 码表与名称 | `logger.c`（fw_rst_name）+ 各模块 |
@@ -95,21 +95,22 @@ fw-c/
 
 ## 测试
 
-`ctest --test-dir build`（或 `build\fw_tests.exe`）——11 个套件、约 300 项断言，用例编号对齐《Test Cases.v4.md》：
+`ctest --test-dir build`（或 `build\fw_tests.exe`）——12 个套件、77 项用例，用例编号对齐《Test Cases.v5.md》：
 
 | 套件 | 覆盖 |
 | --- | --- |
-| t_crc | 1.29/1.31：CRC 自检值 0x29B1、CRC+MSK 顺序 |
+| t_crc | 1.31/1.33：CRC 自检值 0x29B1、CRC+MSK 顺序 |
 | t_value_json | fw_value 生命周期、迷你 JSON（转义/\uXXXX/数字/嵌套/非法输入） |
-| t_codec | 1.5~1.35：§9 全类型往返、恒定宽度、low4=0 非法、SizeMismatch、bool 严格、timestamp 44bit、定长/嵌套/UnknownFieldType/MSK |
-| t_frame | 1.1/1.3/1.4/1.30 帧头往返 + 2.6~2.21/2.29 解析矩阵（REN/ACK/RST/SvcID/StrmID 语义/VER/UDP GetIDL/MSK=1） |
+| t_codec | 1.6~1.38：§9 裸字节全类型往返、值域/字节不足、bool 严格、timestamp 6B、定长无前缀/变长前缀宽度、嵌套、enum 负值/未知值透传、CRC 缺省与开启、末尾字段忽略、大端、MSK |
+| t_frame | 1.1/1.3/1.4/1.32 帧头往返 + 2.6~2.21/2.29 解析矩阵（REN/ACK/RST/SvcID/StrmID 语义/VER/UDP GetIDL/MSK=1） |
 | t_stream | 2.1~2.4 粘包/分包/Length·Mask 跨包 + 2.22~2.24 丢弃模式（解析器层） |
 | t_strm | 4.1/4.2 StrmID 循环/隔离/冷却/REN 重置 |
 | t_entries | 5.5/5.6 SD Entry 编解码与容量 |
-| t_schema | §11.1 IDL 解析、optional/enum/定长/嵌套往返、9.1 末尾新增字段容忍 |
+| t_schema | §11.1 v5 IDL 解析：类型白名单、enum base、fixed_len/max_len 强制（缺失拒绝）、拒绝 optional/size/width、f80 拒绝、嵌套往返、9.1 末尾新增字段容忍 |
 | t_retrans | 3.10~3.12 重传时间线（注入时钟）、3.7 取消、4.5 REN 清记录 |
 | t_tcp | 2.5/2.22/2.23/2.26/2.28：真实 socket 半帧两阶段全场景 |
 | t_integration | 8.1~8.3/5.21/5.28/6.1/6.5/4.4：单进程双栈回环全链路（发现→GetIDL 落盘→call→ff→订阅确认→推送→取消→REN 清缓存→重启本地命中） |
+| t_regress | 6.5 订阅取消 StrmID 回收（130 轮）、5.11 批量 Offer 全量发现、3.19~3.23 心跳、5.22/5.34 GetIDL 场景、5.30 版本并存、5.36 启动预热、6.2/6.10/6.16 订阅确认链路 |
 
 ## 示例
 
@@ -117,7 +118,7 @@ fw-c/
 
 1. `[VERIFY-1]` 服务发现（组播 Offer + 启动 Find 预热）
 2. `[VERIFY-2]` GetIDL 自动拉取落盘（空库 → 拉取 → `.idl-b/4096_v1.json`）
-3. `[VERIFY-3]` rpc GetState 往返（含 optional/定长/float64）
+3. `[VERIFY-3]` rpc GetState 往返（含定长串/变长串/f64/enum）
 4. `[VERIFY-4]` fire_forget UpdateState/UploadBlob（TCP）
 5. `[VERIFY-5]` 订阅确认（ACK 0x10）+ 事件推送交付
 
@@ -150,12 +151,11 @@ fw-c/
 3. **单进程双栈集成测试的调用模式**：`fw_call`/`fw_fire_forget` 等同步 API 的内部泵只驱动本栈（被叫栈需自身事件循环）——单进程双栈场景须用 `fw_call_async` + 双栈泵（fw-nodejs 的 Promise 模型天然无此限制）。fw_stack_poll 每轮无条件驱动收发与连接管理（Windows WSAPoll 对非阻塞 connect 完成不报告就绪）。
 4. **事件到达时 IDL 缺失的处理**：发起异步 GetIDL 并丢弃当前事件（记 Error 日志）；fw-nodejs await 拉取后交付。仅影响"订阅预拉取竞态"窗口，正常路径 schema 已就绪。
 5. **订阅预拉取一律后台化**：fw_subscribe 的 IDL 预拉取为异步（失败仅日志）；fw-nodejs 在主线程场景同步等待拉取完成。
-6. **整型 size>8 不支持**：signed/unsigned 线上宽度 >8 字节（int64/uint64 承载之外）编解码报错（规范允许 1~15）；fw-nodejs 用 BigInt 完整支持。float 80bit 扩展两侧一致不支持。
+6. **整型按 int64 承载**：v5 类型白名单为 u8~u64/i8~i64；u64 值 > INT64_MAX 时 enum/base 校验拒绝（实际 IDL 未使用该范围）；fw-nodejs 超 Number 安全整数时返回 BigInt。f80 三实现一致不支持（协议允许可选，IDL 加载期拒绝）。
 7. **跨栈互通注意事项**：C 栈的 TCP 出站连接源地址由系统选路（可能为 127.0.0.1），与 UDP 绑定地址（127.0.0.2）不同——tcp-event 按源 IP 匹配连接的场景（本示例 IDL 未使用）需部署时保证两侧地址口径一致（fw-nodejs 同样存在该现象）。
 8. **日志级别为进程级全局**（`fw_log_set_level`）：多栈共用；fw-nodejs 每栈独立 logger。
 
 ## 已知问题与遗留
 
-- 首轮跨栈互通（JS-B → C-A）曾出现一次 ff UpdateState 解码失败（RST 0x20），复跑多轮未再现；怀疑为 A 侧注册完成前的时序竞争（ff 尽力而为语义，应用可重试）。如复现可打开 `FW_LOG_DEBUG` 定位。
 - `MinGW Makefiles` 生成器未在本机验证（缺 mingw32-make），见构建说明。
 - IPv6 组播（ff02::1:BB）未实现（fw-nodejs 同样仅 IPv4）。

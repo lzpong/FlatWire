@@ -55,10 +55,10 @@ int64_t fw_plat_now_ms(void);
 // 毫秒级休眠（测试辅助；事件循环内禁止调用）
 void fw_sleep_ms(int ms);
 
-// ---- 平台随机（§10 MSK key：[REVIEW P3-1] 换用平台 CSPRNG，替换时钟推导） ----
+// ---- 平台随机（§10 MSK key：换用平台 CSPRNG，替换时钟推导） ----
 void fw_plat_random_bytes(uint8_t *buf, int n);
 
-// ---- 本机 IPv4 地址枚举（§2 自我回环过滤；[REVIEW P3-11] 对齐 JS networkInterfaces） ----
+// ---- 本机 IPv4 地址枚举（§2 自我回环过滤；对齐 JS networkInterfaces） ----
 // 填充 addrs（每项点分十进制），返回写入条数（失败返回 0，调用方回退默认集）
 int fw_plat_local_addrs(char addrs[][48], int max);
 

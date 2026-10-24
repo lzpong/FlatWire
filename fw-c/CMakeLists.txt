@@ -1,5 +1,5 @@
 # ============================================================
-# FlatWire Protocol v4.4 —— C 实现构建脚本
+# FlatWire Protocol v5.0 —— C 实现构建脚本
 #
 # 要求：CMake >= 3.15，C11 编译器（MSVC VS2019+ / GCC / Clang），零第三方依赖
 # 本机验证：cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
@@ -57,7 +57,7 @@ target_include_directories(fw PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(fw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if(WIN32)
-  target_link_libraries(fw PUBLIC ws2_32 iphlpapi) # iphlpapi：[REVIEW P3-11] 本机地址枚举
+  target_link_libraries(fw PUBLIC ws2_32 iphlpapi) # iphlpapi：本机地址枚举
   target_compile_definitions(fw PRIVATE _WIN32_WINNT=0x0601 NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 

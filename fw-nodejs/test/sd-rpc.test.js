@@ -73,16 +73,17 @@ test('3.13 REN 清空该对端重传记录（前缀过滤）', () => {
 // 双栈集成（真实回环）：A 注册服务（rpc/ff/event），B 空 IDL 库起步
 // ============================================================
 
-// 测试服务 IDL（§11.1 语法：interfaces.input/output 引用 type_def.structs 类型名）
+// 测试服务 IDL（v5 §11.1 语法：interfaces.input/output 引用 type_def 类型名；
+// 类型独立化为 u16/i16；string 必须声明 fixed_len 或 max_len）
 const SVC_ID = 4096;
 const TEST_IDL = {
   // type_def 与 service 平级（§11.1 顶层语法）
   type_def: {
     structs: {
-      ReqIn:  [{ name: 'a', type: 'unsigned', size: 2 }, { name: 'b', type: 'unsigned', size: 2 }],
-      SumOut: [{ name: 'sum', type: 'unsigned', size: 4 }],
-      FfIn:   [{ name: 'note', type: 'string' }],
-      EvIn:   [{ name: 'temp', type: 'signed', size: 2 }],
+      ReqIn:  [{ name: 'a', type: 'u16' }, { name: 'b', type: 'u16' }],
+      SumOut: [{ name: 'sum', type: 'u32' }],
+      FfIn:   [{ name: 'note', type: 'string', max_len: 64 }],
+      EvIn:   [{ name: 'temp', type: 'i16' }],
     },
   },
   service: {

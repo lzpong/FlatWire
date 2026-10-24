@@ -64,7 +64,7 @@ uint32_t fw_frame_encode(uint8_t *buf, uint32_t cap, const fw_frame_desc_t *d) {
     if (d->mask_key) {
       memcpy(key, d->mask_key, 4);
     } else {
-      // [REVIEW P3-1] 平台 CSPRNG 生成（原实现取时钟字节：最高字节恒 0、低位窗口
+      // 平台 CSPRNG 生成（原实现取时钟字节：最高字节恒 0、低位窗口
       // 内恒定可预测，削弱 §10 规避中间设备误识别用途；JS 用 crypto.randomBytes）
       fw_plat_random_bytes(key, 4);
     }
@@ -342,7 +342,7 @@ static void sp_consume_drop(fw_stream_parser_t *p) {
 
 static void sp_loop(fw_stream_parser_t *p);
 
-// [REVIEW P3-8] 返回 FW_OK / FW_ERR_MEMORY：realloc 失败不再静默丢 chunk（返回状态
+// 返回 FW_OK / FW_ERR_MEMORY：realloc 失败不再静默丢 chunk（返回状态
 // 供连接层决策；旧调用点忽略返回值仍兼容——签名由 void 改 int）
 int fw_sp_feed(fw_stream_parser_t *p, const uint8_t *chunk, size_t n) {
   // 追加到待解析缓冲（分包不丢弃已读字节，§4.1）
@@ -352,7 +352,7 @@ int fw_sp_feed(fw_stream_parser_t *p, const uint8_t *chunk, size_t n) {
     uint8_t *nb = (uint8_t *)realloc(p->buf, nc);
     if (!nb) {
       fw_log(FW_LOG_ERROR, "frame", "sp_feed realloc failed (%zu bytes buffered, %zu dropped)",
-             p->len, n); // [REVIEW P3-8] 失败显式记日志（原静默丢弃仅半帧超时兜底）
+             p->len, n); // 失败显式记日志（原静默丢弃仅半帧超时兜底）
       return FW_ERR_MEMORY;
     }
     p->buf = nb;
@@ -451,7 +451,7 @@ static void sp_loop(fw_stream_parser_t *p) {
         while (nc < h.payload_len) nc *= 2;
         uint8_t *ns = (uint8_t *)realloc(p->scratch, nc);
         if (!ns) {
-          // [REVIEW P3-8] 失败记日志（原静默返回，依赖后续 feed 重试）
+          // 失败记日志（原静默返回，依赖后续 feed 重试）
           fw_log(FW_LOG_ERROR, "frame", "sp scratch realloc failed (%uB frame abandoned)",
                  h.payload_len);
           return; // 内存不足：放弃本帧（连接层半帧超时兜底）

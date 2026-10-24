@@ -1,9 +1,9 @@
 // ============================================================
-// fw.h —— FlatWire Protocol v4.4 C 实现公共头（唯一公共契约）
+// fw.h —— FlatWire Protocol v5.0 C 实现公共头（唯一公共契约）
 //
 // 应用视角 API（§13）+ 内部模块契约（codec/frame/strm/entries 等，
 // 供单元测试与模块间共享）。规范唯一事实来源：
-//   《FlatWire Protocol (FW) Design.v4.md》
+//   《FlatWire Protocol (FW) Design.v5.md》
 // 行为基准：implementations/fw-nodejs（同名模块逻辑交叉对照）
 // ============================================================
 
@@ -52,18 +52,14 @@ extern "C" {
 #define FW_ERR_UNSUPPORTED     -14  // 不支持（float80/整型 size>8）
 #define FW_ERR_STATE           -15  // 状态机不允许的操作
 
-// ---- 解码错误细分（codec 层负值，统一映射 RST(0x20)，§9.4/§12.1） ----
-#define FW_DEC_UNEXPECTED_NULL      -101  // 非 optional 字段遇 null（§9.2）
-#define FW_DEC_INVALID_BOOL         -102  // bool low4∉{0,1}（§9.1）
-#define FW_DEC_INVALID_SIGNED_LEN   -103  // signed low4=0（§9.1）
-#define FW_DEC_INVALID_UNSIGNED_LEN -104  // unsigned low4=0
-#define FW_DEC_SIZE_MISMATCH        -105  // byte_len != IDL size（§9.2 恒定宽度）
-#define FW_DEC_UNKNOWN_FIELD        -106  // 字段类型 0x9~0xF（§9.4）
-#define FW_DEC_UNSUPPORTED_FLOAT    -107  // float 子类型非法/80bit 不支持
-#define FW_DEC_UNDERRUN             -108  // 缓冲不足（数据截断）
+// ---- 解码错误细分（codec 层负值，统一映射 RST(0x20)，§9.1/§9.3/§12.1） ----
+#define FW_DEC_UNEXPECTED_NULL      -101  // 值为 null（v5 无 null 编码，字段必填）
+#define FW_DEC_INVALID_BOOL         -102  // bool 非 0x00/0x01（§9.2）
+#define FW_DEC_UNSUPPORTED_FLOAT    -103  // f80 可选扩展本端不支持
+#define FW_DEC_UNDERRUN             -108  // 字段字节不足（数据截断）
 #define FW_DEC_MAXLEN               -109  // max_len 超限（IDL 级 → 0x20）
 #define FW_DEC_FIXEDLEN             -110  // fixed_len 不符
-#define FW_DEC_RANGE                -111  // 编码值超出位宽范围
+#define FW_DEC_RANGE                -111  // 编码值超出类型值域
 #define FW_DEC_CRC                  -112  // CRC-16 校验失败（§9.6）
 
 // RST 错误码名称表（§12.4 日志 Msg 字段）
@@ -292,7 +288,7 @@ struct fw_stream_parser {
 
 void fw_sp_init(fw_stream_parser_t *p);
 void fw_sp_free(fw_stream_parser_t *p);
-// [REVIEW P3-8] 返回 FW_OK / FW_ERR_MEMORY（realloc 失败显式上报，原 void 静默丢 chunk）
+// 返回 FW_OK / FW_ERR_MEMORY（realloc 失败显式上报，原 void 静默丢 chunk）
 int  fw_sp_feed(fw_stream_parser_t *p, const uint8_t *chunk, size_t n);
 int  fw_sp_receiving(const fw_stream_parser_t *p);   // receiving || drop_mode
 int  fw_sp_header_complete(const fw_stream_parser_t *p);
@@ -311,40 +307,47 @@ int      fw_crc16_selfcheck(void);
 // ============================================================
 // §9 结构化数据字段编解码（schema 驱动）
 // ============================================================
-// 规范化类型种类（fw_tdesc_t.kind）
-#define FW_T_BOOL      1
-#define FW_T_SIGNED    2
-#define FW_T_UNSIGNED  3
-#define FW_T_FLOAT     4
-#define FW_T_TIMESTAMP 5
-#define FW_T_STRING    6
-#define FW_T_BYTES     7
-#define FW_T_ARRAY     8
-#define FW_T_ENUM      9
-#define FW_T_STRUCT    10
+// 规范化类型种类（fw_tdesc_t.kind；v5.0 裸字节编码类型白名单 §9.2）
+#define FW_T_U8        1
+#define FW_T_U16       2
+#define FW_T_U32       3
+#define FW_T_U64       4
+#define FW_T_I8        5
+#define FW_T_I16       6
+#define FW_T_I32       7
+#define FW_T_I64       8
+#define FW_T_F32       9
+#define FW_T_F64      10
+#define FW_T_F80      11   // x87 80bit 可选扩展（本实现不支持 → IDL 加载失败）
+#define FW_T_BOOL     12
+#define FW_T_TIMESTAMP 13
+#define FW_T_ENUM     14
+#define FW_T_STRING   15
+#define FW_T_BYTES    16
+#define FW_T_ARRAY    17
+#define FW_T_STRUCT   18
 
 typedef struct fw_tdesc fw_tdesc_t;
 typedef struct fw_tfield fw_tfield_t;
 
 struct fw_tdesc {
-  int  kind;
+  int  kind;              // FW_T_*（§9.2 白名单）
   char name[64];
-  int  size;              // signed/unsigned/enum 线上宽度（1~15，恒定宽度 §9.2）
-  int  width;             // float：32/64（80 不支持）
-  int  fixed_len;         // string/bytes/array：-1=未声明
-  int  max_len;           // -1=未声明
-  int  enum_base;         // enum 底层：FW_T_SIGNED/FW_T_UNSIGNED
+  int  size;              // 线上宽度（字节）：整型 1/2/4/8、float 4/8/10、bool 1、timestamp 6、enum=base 宽度
+  int  fixed_len;         // string/bytes/array：N=定长裸排（无长度前缀）；-1=未声明
+  int  max_len;           // string/bytes/array：N=变长（w(N) 字节长度前缀）；-1=未声明
+  int  enum_base;         // enum 基类型符号：0=无符号 / 1=有符号（§9.2）
   struct { char name[32]; int64_t val; } *enum_vals; int enum_n; // 名称→整数映射
   fw_tdesc_t *element;    // array 元素类型（指向共享 tdesc，不随本体释放）
-  fw_tfield_t *fields;    // struct 字段列表
+  fw_tfield_t *fields;    // struct 字段列表（按 schema 顺序裸排 §9.4）
   int field_n;
   int owned;              // 内存归属：1=字段级独立分配（随引用者释放）；0=cache 共享
 };
 
+// 结构体字段（v5.0：全部必填，无 optional、无 null 编码 §9.1）
 struct fw_tfield {
   char name[64];
   fw_tdesc_t *type;       // 规范化类型（schema 持有）
-  int optional;
 };
 
 // 接口类型（IDL interface.type）
@@ -379,12 +382,12 @@ typedef struct {
 typedef struct {
   char name[64];
   int  kind;            // 0=struct 1=enum 2=array
-  // struct 字段原始定义
+  // struct 字段原始定义（v5.0：无 optional/size/width）
   struct {
     char name[64]; char type[64]; char element_type[64];
-    int optional, size, width, fixed_len, max_len;
+    int fixed_len, max_len;
   } *fields; int field_n, field_cap;
-  // enum
+  // enum（base 为整型基类型名，默认 u8，§9.2）
   char base[16]; int size;
   struct { char name[32]; int64_t val; } *vals; int val_n;
   // array

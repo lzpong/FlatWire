@@ -189,13 +189,13 @@ void fw_events_notify(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, uint16_t
   snprintf(ck, sizeof(ck), "%u:%u:%u", svc_id, inst_id, if_id);
   cache_put(st, ck, body.p, (uint32_t)body.len);
   // 分发给所有订阅者（单接口订阅 + 组订阅展开，§8.2）
-  // [REVIEW P3-9] 订阅者快照改堆分配（原 static[64] 截断）
+  // 订阅者快照改堆分配（原 static[64] 截断）
   fw_sub_rec_t *subs = NULL;
   int ns = 0;
   fw_disc_subscribers_of(st, svc_id, inst_id, if_id, &subs, &ns);
   for (int i = 0; i < ns; i++)
     push_to_one(st, &subs[i], svc_id, inst_id, iface, body.p, (uint32_t)body.len);
-  free(subs); // [REVIEW P3-9]
+  free(subs);
   fw_buf_free(&body);
 }
 
@@ -227,7 +227,7 @@ void fw_events_push_cached_for(fw_stack_t *st, const fw_meta_t *meta,
       }
     } else if (e->grp_id != 0) {
       // 组订阅：展开为组内所有 event 接口（§7.1/§8.1）
-      // [REVIEW P3-9] 组成员列表改堆分配（原固定 out[64]）
+      // 组成员列表改堆分配（原固定 out[64]）
       uint16_t *members = NULL;
       int mn = 0;
       fw_disc_group_members(st, e->svc_id, e->grp_id, &members, &mn);
@@ -247,7 +247,7 @@ void fw_events_push_cached_for(fw_stack_t *st, const fw_meta_t *meta,
           push_to_one(st, &sub, e->svc_id, e->inst_id, iface, buf, len);
         }
       }
-      free(members); // [REVIEW P3-9]
+      free(members);
     }
   }
 }
@@ -256,7 +256,7 @@ void fw_events_push_cached_for(fw_stack_t *st, const fw_meta_t *meta,
 // ============================================================
 
 // 会话是否匹配帧的 (svc, inst, if_id)（单接口精确 + 组订阅展开，§7.1/§7.4）
-// [REVIEW P2-5] 提取为独立判定（匹配收集与交付前复核共用，防回调内会话表变更后错配）
+// 提取为独立判定（匹配收集与交付前复核共用，防回调内会话表变更后错配）
 static int sess_matches_frame(fw_stack_t *st, const fw_session_t *s, const fw_frame_t *f) {
   if (s->svc_id != f->svc_id || s->inst_id != f->inst_id) return 0;
   if (s->if_id == f->if_id) return 1;
@@ -264,7 +264,7 @@ static int sess_matches_frame(fw_stack_t *st, const fw_session_t *s, const fw_fr
     // 组订阅：帧 if_id ∈ 组成员（§7.1）
     uint16_t *members = NULL;
     int mn = 0;
-    fw_disc_group_members(st, f->svc_id, s->grp_id, &members, &mn); // [REVIEW P3-9] 动态
+    fw_disc_group_members(st, f->svc_id, s->grp_id, &members, &mn); // 动态
     int hit = 0;
     for (int k = 0; k < mn; k++)
       if (members[k] == f->if_id) { hit = 1; break; }
@@ -311,7 +311,7 @@ static void on_notification(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t
   }
 
   // 匹配本地订阅会话（§7.4：0x10 前到达的事件按容错交付，不筛会话状态）
-  // [REVIEW P2-5] 原实现存 sessions 下标：回调内 fw_unsubscribe/fw_subscribe 触发
+  // 原实现存 sessions 下标：回调内 fw_unsubscribe/fw_subscribe 触发
   // swap-remove/追加会使后续迭代索引错位（错配/漏配/越界读）。改为快照
   // (handle, on_event, ud) 三元组 + 交付前按 handle 重查并复核匹配条件（两遍交付）
   int cap = st->disc.nsess > 0 ? st->disc.nsess : 1;
@@ -336,7 +336,7 @@ static void on_notification(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t
   }
 
   // 解码（事件 payload 定义在 IDL output 方向，§11.1）
-  // [REVIEW P2-6] 按帧对应实例的发现缓存 MajorVer 取已加载定义（多版本并存时避免
+  // 按帧对应实例的发现缓存 MajorVer 取已加载定义（多版本并存时避免
   // 固定取最高版解码错配），实例不在缓存/版本未加载再退最高版本
   fw_idl_entry_t *e = NULL;
   fw_disc_rec_t *dr = fw_disc_get_discovered(st, f->svc_id, f->inst_id);
@@ -344,7 +344,7 @@ static void on_notification(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t
   if (!e) e = fw_idl_get_highest(st->idl, f->svc_id);
   if (!e) {
     // 库中无该服务定义：查发现缓存在线实例 → 自动拉取（无在线实例不查询，§7.2）
-    //（[REVIEW P2-6] 拉取版本按实例记录，缺失时取任一在线版本）
+    //（拉取版本按实例记录，缺失时取任一在线版本）
     int major = dr ? dr->major_ver : fw_disc_online_major_ver(st, f->svc_id);
     if (major >= 0) {
       fw_disc_fetch_idl_async(st, f->svc_id, (uint8_t)major);
@@ -369,7 +369,7 @@ static void on_notification(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t
   }
   // 交付（每个匹配会话独立回调，§8.2；payload 所有权转移给回调——
   // 多会话场景：前面的会话收克隆，最后一个会话移交原值）
-  // [REVIEW P2-5] 按 handle 重查 + 复核匹配条件（回调内增删会话表时仍准确交付）
+  // 按 handle 重查 + 复核匹配条件（回调内增删会话表时仍准确交付）
   int delivered = 0;
   for (int i = 0; i < nmatched; i++) {
     fw_session_t *s = NULL;

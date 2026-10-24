@@ -55,7 +55,7 @@ void fw_disc_free(fw_stack_t *st) {
   fw_retransmit_free(&st->disc.retrans);
   free(st->disc.locals); free(st->disc.subs);
   free(st->disc.disc); free(st->disc.sessions);
-  free(st->disc.cancels); // [REVIEW P1-1] 取消等待表随模块释放
+  free(st->disc.cancels); // 取消等待表随模块释放
   free(st->disc.pf); free(st->disc.queries); free(st->disc.ack);
   memset(&st->disc, 0, sizeof(st->disc));
 }
@@ -65,7 +65,7 @@ void fw_disc_stop(fw_stack_t *st) {
   fw_retransmit_init(&st->disc.retrans, st->cfg.retransmit_interval_ms, st->cfg.retransmit_max);
   st->disc.nsubs = 0;
   st->disc.nsess = 0;
-  st->disc.ncxl = 0; // [REVIEW P1-1] 清空取消等待
+  st->disc.ncxl = 0; // 清空取消等待
   st->disc.npf = 0;
   st->disc.nq = 0;
   st->disc.nack = 0;
@@ -331,7 +331,7 @@ void fw_disc_on_offer(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta
     fw_log(FW_LOG_WARN, "sd", "Offer payload not aligned (%uB), dropped", len);
     return;
   }
-  // [REVIEW P1-2] 接收端全量解码：上限 = 帧内实际 Entry 数（发送端拆帧满装 233/帧，
+  // 接收端全量解码：上限 = 帧内实际 Entry 数（发送端拆帧满装 233/帧，
   // 原 es[64] 硬上限静默丢弃第 65+ 个 Entry，违反 §7.2"逐帧独立处理"；对齐 JS 无上限）
   int cap = (int)(len / FW_ENTRY_OFFER);
   fw_offer_entry_t *es = (fw_offer_entry_t *)malloc((size_t)cap * sizeof(fw_offer_entry_t));
@@ -385,7 +385,7 @@ void fw_disc_on_offer(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta
     disc_rec_init(fresh, e, meta, f->ver);
     transition_found(st, fresh);
   }
-  free(es); // [REVIEW P1-2] 堆分配解码缓冲释放
+  free(es); // 堆分配解码缓冲释放
 }
 
 // ============================================================
@@ -395,7 +395,7 @@ void fw_disc_on_offer(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta
 void fw_disc_on_find(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta) {
   const uint8_t *pl = f->payload;
   uint32_t len = f->payload_len;
-  // [REVIEW P1-2] 响应数组按本地实例数堆分配（原 resp[64] 截断：>64 实例时
+  // 响应数组按本地实例数堆分配（原 resp[64] 截断：>64 实例时
   // Find 响应漏报；对齐 JS onFind 无上限语义）
   fw_offer_entry_t *resp = (fw_offer_entry_t *)malloc(
     (size_t)(st->disc.nlocals > 0 ? st->disc.nlocals : 1) * sizeof(fw_offer_entry_t));
@@ -419,7 +419,7 @@ void fw_disc_on_find(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta)
       free(resp);
       return; // 整帧无法解析 → 静默
     }
-    // [REVIEW P1-2] Find 请求按帧实际 Entry 数堆解码（原 qs[64] 截断）
+    // Find 请求按帧实际 Entry 数堆解码（原 qs[64] 截断）
     int cap = (int)(len / FW_ENTRY_FIND);
     fw_find_entry_t *qs = (fw_find_entry_t *)malloc((size_t)cap * sizeof(fw_find_entry_t));
     if (!qs) { fw_log(FW_LOG_ERROR, "sd", "Find decode out of memory"); free(resp); return; }
@@ -450,7 +450,7 @@ void fw_disc_on_find(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta)
   }
   if (nr == 0) { free(resp); return; } // Find 查询不存在：组播不强制回应（§12.2）
   // 响应帧格式与 Offer 相同（Code=0x01），UDP 单播发送，恒走 server socket（裁定 4）
-  // [REVIEW P1-2] 发送侧沿用满装拆帧循环（与 fw_disc_build_offers 口径一致）
+  // 发送侧沿用满装拆帧循环（与 fw_disc_build_offers 口径一致）
   uint8_t buf[1536];
   int max_entries = (int)(st->cfg.max_payload_len / FW_ENTRY_OFFER);
   if (max_entries < 1) max_entries = 1;
@@ -514,7 +514,7 @@ static void send_sub_ack(fw_stack_t *st, int code, uint8_t strm, const fw_meta_t
   a->expiry = now_ms(st);
 }
 
-// 在本地 IDL 库中查接口定义（[REVIEW P2-6] 按发现缓存该实例的 MajorVer 匹配已加载
+// 在本地 IDL 库中查接口定义（按发现缓存该实例的 MajorVer 匹配已加载
 // 定义——多版本并存时（§7.2 部署异常场景）避免固定取最高版导致解码错配；实例未在
 // 缓存时退回最高版本（对齐 JS _lookupInterface 宽容语义））
 static fw_iface_t *lookup_interface(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, uint16_t if_id) {
@@ -535,7 +535,7 @@ void fw_disc_on_subscribe(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *
     fw_udp_send_frame(st, &d, meta->address, meta->port, 1);
     return;
   }
-  // [REVIEW P1-2] 合并 Subscribe 按帧实际 Entry 数堆解码（原 es[32] 截断，对齐 JS 无上限）
+  // 合并 Subscribe 按帧实际 Entry 数堆解码（原 es[32] 截断，对齐 JS 无上限）
   int cap = (int)(len / FW_ENTRY_SUB);
   fw_sub_entry_t *es = (fw_sub_entry_t *)malloc((size_t)cap * sizeof(fw_sub_entry_t));
   if (!es) { fw_log(FW_LOG_ERROR, "sd", "Subscribe decode out of memory (%d entries)", cap); return; }
@@ -648,11 +648,11 @@ void fw_disc_on_subscribe(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *
     // 订阅记录从无到有 → 全量推送（数据分发，非确认信号；每条订阅仅一次，§8.1）
     fw_disc_on_subscription_added(st, meta, es, n);
   }
-  free(es); // [REVIEW P1-2] 堆分配解码缓冲释放
+  free(es); // 堆分配解码缓冲释放
 }
 
 // 订阅者查询（events 推送用，§8.2）：单接口精确 + 组订阅展开
-// [REVIEW P3-9] 快照改堆分配（原 static[64] 硬上限：订阅者 >64 时推送漏发且
+// 快照改堆分配（原 static[64] 硬上限：订阅者 >64 时推送漏发且
 // static 缓冲跨调用复用）；*out 由调用者 free
 void fw_disc_subscribers_of(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, uint16_t if_id,
                             fw_sub_rec_t **out, int *out_n) {
@@ -674,7 +674,7 @@ void fw_disc_subscribers_of(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, ui
       for (int k = 0; k < mn; k++) {
         if (members[k] == if_id) { snapshot[n++] = *s; break; }
       }
-      free(members); // [REVIEW P3-9] 组成员动态缓冲
+      free(members); // 组成员动态缓冲
     }
   }
   *out = snapshot;
@@ -682,7 +682,7 @@ void fw_disc_subscribers_of(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, ui
 }
 
 // 查 IDL 事件组成员（本地库定义，§7.1）
-// [REVIEW P3-9] 成员列表堆分配（原调用方固定 out[64] 截断）；*out 由调用者 free
+// 成员列表堆分配（原调用方固定 out[64] 截断）；*out 由调用者 free
 void fw_disc_group_members(fw_stack_t *st, uint16_t svc_id, uint8_t grp_id,
                            uint16_t **out, int *out_n) {
   *out = NULL;
@@ -817,7 +817,7 @@ int fw_disc_find(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,
   }
   p->deadline_ms = now_ms(st) + (timeout_ms ? timeout_ms : st->cfg.response_timeout_ms);
   // 同步等待（泵事件循环；调用方保证 dispatch==0）。
-  // [REVIEW P2-3] 原实现依赖 FW_W_FIND 等待者置 done 标志，但 fw_waiters_fire 对
+  // 原实现依赖 FW_W_FIND 等待者置 done 标志，但 fw_waiters_fire 对
   // FW_W_FIND 无分支 → done 永不置位，Offer 到达也不唤醒，find_service 恒等满
   // timeout；改为逐轮轮询发现缓存（对齐 JS pendingFind Promise 即时 resolve）
   int64_t deadline = p->deadline_ms;
@@ -913,7 +913,7 @@ uint32_t fw_disc_subscribe(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,
 
 // unsubscribe（§13.2）：发 Subscribe(TTL=0)（CON）等待 ACK(0x00)；
 // 应用视角立即完成（登记删除），服务端订阅靠 TTL 自愈兜底。
-// [REVIEW P1-1] 会话 StrmID 生命周期：原实现把 cancel_deadline 写在即将被 swap
+// 会话 StrmID 生命周期：原实现把 cancel_deadline 写在即将被 swap
 // 覆盖的槽位上 → ACK(0x00) 匹配失效，StrmID 永不释放（130 轮池耗尽）。改为登记
 // 到独立取消等待表 cancels（对齐 JS cancelPending），ACK 到达或重传耗尽兜底释放。
 int fw_disc_unsubscribe(fw_stack_t *st, uint32_t handle) {
@@ -924,7 +924,7 @@ int fw_disc_unsubscribe(fw_stack_t *st, uint32_t handle) {
     if (s->retrans_key[0]) { fw_retransmit_cancel(&st->disc.retrans, s->retrans_key); s->retrans_key[0] = 0; }
     if (s->session_strm && s->addr[0]) {
       send_subscribe(st, s, 0, 1); // 取消（TTL=0, CON，同会话 StrmID，§8.1 场景4）
-      // [REVIEW P1-1] 取消等待登记：保留会话 StrmID 直至 ACK(0x00)（§6.1/6.5）
+      // 取消等待登记：保留会话 StrmID 直至 ACK(0x00)（§6.1/6.5）
       if (st->disc.ncxl == st->disc.cxlcap) {
         int nc = st->disc.cxlcap ? st->disc.cxlcap * 2 : 8;
         void *np = realloc(st->disc.cancels, (size_t)nc * sizeof(fw_cancel_pend_t));
@@ -964,7 +964,7 @@ void fw_disc_session_tick(fw_stack_t *st, int64_t now) {
         send_subscribe(st, s, 0, 0); // 保活 NON，不回确认（§8.1）
     }
   }
-  // [REVIEW P1-1] 取消重传耗尽兜底：释放取消等待（§8.1 场景4；服务端靠 TTL 自愈）
+  // 取消重传耗尽兜底：释放取消等待（§8.1 场景4；服务端靠 TTL 自愈）
   for (int i = 0; i < st->disc.ncxl; ) {
     fw_cancel_pend_t *c = &st->disc.cancels[i];
     if (c->deadline && now >= c->deadline) {
@@ -1000,7 +1000,7 @@ void fw_disc_on_subscribe_ack(fw_stack_t *st, const fw_frame_t *f, const fw_meta
 }
 
 // 收到取消确认 ACK(Code=0x00)（§8.1）：释放会话 StrmID
-// [REVIEW P1-1] 按 (peer, StrmID) 匹配取消等待表（原实现匹配 sessions 中
+// 按 (peer, StrmID) 匹配取消等待表（原实现匹配 sessions 中
 // cancel_deadline 会话——该槽位已被 swap 覆盖，匹配永不成功）
 void fw_disc_on_unsubscribe_ack(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta) {
   char peer[80];
@@ -1181,7 +1181,7 @@ void fw_disc_tick_queries(fw_stack_t *st, int64_t now) {
     if (!q->done) {
       query_pump(st, q, now);
       if (!q->done && q->sent && q->deadline_ms && now >= q->deadline_ms) {
-        // 查询超时：释放/冷却，查询失败上抛当前操作（§7.2 v4.4 定案：由应用决定重试）
+        // 查询超时：释放/冷却，查询失败上抛当前操作（§7.2：由应用决定重试）
         q->done = 1;
         q->err = FW_ERR_GETIDL;
         snprintf(q->msg, sizeof(q->msg), "GetIDL timeout (svc=%u)", q->svc_id);
@@ -1232,10 +1232,10 @@ static fw_idl_query_t *query_start(fw_stack_t *st, uint16_t svc_id, uint8_t majo
 }
 
 // GetIDL 同步拉取（§7.2 双角色统一：调用/订阅/注册前本地 IDL 缺失时自动触发）。
-// 查询失败（0x24/0x20/超时/断连）一律上抛当前操作（§7.2 v4.4 定案）。
+// 查询失败（0x24/0x20/超时/断连）一律上抛当前操作（§7.2）。
 fw_schema_t *fw_disc_fetch_idl(fw_stack_t *st, uint16_t svc_id, uint8_t major_ver,
                                int *err_code, char *err, int errsz) {
-  // [REVIEW P2-4] 不再挂等待者（原 w 挂 q->waiters，泵期间 queries realloc 会使
+  // 不再挂等待者（原 w 挂 q->waiters，泵期间 queries realloc 会使
   // 摘除路径的 q 指针悬空）：泵循环内逐轮按 (svc_id, major_ver) 重查条目
   if (!query_start(st, svc_id, major_ver, NULL)) {
     // 发现缓存无在线实例 → 不发起查询，当前操作直接失败（§7.2/5.22）
@@ -1245,7 +1245,7 @@ fw_schema_t *fw_disc_fetch_idl(fw_stack_t *st, uint16_t svc_id, uint8_t major_ve
   }
   int64_t abs_deadline = now_ms(st) + (int64_t)st->cfg.response_timeout_ms * 2 + 1000;
   for (;;) {
-    // [REVIEW P2-4] 每轮重查查询条目（poll 处理帧期间应用回调可能经 fw_call_async
+    // 每轮重查查询条目（poll 处理帧期间应用回调可能经 fw_call_async
     // → fw_disc_query_attach 触发 queries realloc，外层指针禁止跨轮持有）
     fw_idl_query_t *cur = NULL;
     for (int i = 0; i < st->disc.nq; i++) {
@@ -1355,18 +1355,18 @@ void fw_disc_on_ren(fw_stack_t *st, const fw_meta_t *meta) {
       st->disc.nsubs--;
     } else i++;
   }
-  // 3) [REVIEW P1-1] 清取消等待（对齐 JS onRen 的 cancelPending.clear()；
+  // 3) 清取消等待（对齐 JS onRen 的 cancelPending.clear()；
   //    StrmID 池由后续 fw_strm_reset_peer 统一重置，此处仅摘重传与表项）
   for (int i = 0; i < st->disc.ncxl; ) {
     if (strncmp(st->disc.cancels[i].peer, ip, strlen(ip)) == 0 &&
-        st->disc.cancels[i].peer[strlen(ip)] == ':') { // [REVIEW P2-2] ':' 界定防 IP 前缀撞车
+        st->disc.cancels[i].peer[strlen(ip)] == ':') { // ':' 界定防 IP 前缀撞车
       if (st->disc.cancels[i].retrans_key[0])
         fw_retransmit_cancel(&st->disc.retrans, st->disc.cancels[i].retrans_key);
       st->disc.cancels[i] = st->disc.cancels[st->disc.ncxl - 1];
       st->disc.ncxl--;
     } else i++;
   }
-  // 4) 确认缓存清理（[REVIEW P2-2] key 格式 "ip:port|strm"：前缀匹配须以 ':' 界定，
+  // 4) 确认缓存清理（key 格式 "ip:port|strm"：前缀匹配须以 ':' 界定，
   //    防 "1.2.3.4" 误清 "1.2.3.45" 的确认缓存——对齐 JS startsWith(`${ip}:`)）
   for (int i = 0; i < st->disc.nack; ) {
     const char *k = st->disc.ack[i].key;

@@ -50,7 +50,7 @@ void fw_rpc_free(fw_stack_t *st) {
 
 void fw_call_ctx_free(fw_stack_t *st, fw_call_ctx_t *ctx) {
   (void)st;
-  // [REVIEW P3-12] 从全量活动链摘除（所有释放路径统一经过此处）
+  // 从全量活动链摘除（所有释放路径统一经过此处）
   for (fw_call_ctx_t **pp = &st->rpc.active; *pp; pp = &(*pp)->anext) {
     if (*pp == ctx) { *pp = ctx->anext; ctx->anext = NULL; break; }
   }
@@ -107,14 +107,14 @@ fw_call_ctx_t *fw_call_ctx_new(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,
   // 内嵌等待者自指（waiters_fire 回调定位 ctx——缺失将导致 advance(st, NULL) UB）
   ctx->w.kind = FW_W_CALL;
   ctx->w.ctx = ctx;
-  // [REVIEW P3-12] 登记全量活动链（含 resolve 阶段 async ctx——原实现仅 wait 阶段
+  // 登记全量活动链（含 resolve 阶段 async ctx——原实现仅 wait 阶段
   // 在 pending/ff_pending 链，resolve/send 阶段挂起的 async ctx 无处枚举，stop 悬挂）
   ctx->anext = st->rpc.active;
   st->rpc.active = ctx;
   return ctx;
 }
 
-// [REVIEW P3-12] stop 前冲刷全部未完成调用：async ctx 以 err 触发完成回调（不悬挂）；
+// stop 前冲刷全部未完成调用：async ctx 以 err 触发完成回调（不悬挂）；
 // 同步 ctx（cb 为空，仅同线程泵场景存在）标记终态防泄漏。遍历中 free 会修改链头。
 void fw_rpc_flush_all_pending(fw_stack_t *st, int err, const char *msg) {
   fw_call_ctx_t *c = st->rpc.active;

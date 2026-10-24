@@ -7,7 +7,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <direct.h>
-#include <iphlpapi.h> // [REVIEW P3-11] GetAdaptersAddresses（链接 iphlpapi）
+#include <iphlpapi.h> // GetAdaptersAddresses（链接 iphlpapi）
 
 // ---- socket 基础 ----
 
@@ -87,7 +87,7 @@ void fw_sleep_ms(int ms) {
   if (ms > 0) Sleep((DWORD)ms);
 }
 
-// ---- 平台随机（§10 MSK key；[REVIEW P3-1] 用 RtlGenRandom 替换时钟推导） ----
+// ---- 平台随机（§10 MSK key；用 RtlGenRandom 替换时钟推导） ----
 // SystemFunction036（RtlGenRandom）来自 advapi32：经 GetProcAddress 动态加载，
 // 零额外链接依赖；加载失败回退多源熵混合（QPC 高分辨率计数 + 时钟 + 进程/栈地址 ASLR）
 typedef BOOLEAN (WINAPI *fn_rtlgenrandom_t)(void *buf, ULONG len);
@@ -110,7 +110,7 @@ void fw_plat_random_bytes(uint8_t *buf, int n) {
   }
 }
 
-// ---- 本机 IPv4 地址枚举（[REVIEW P3-11] GetAdaptersAddresses 对齐 JS networkInterfaces） ----
+// ---- 本机 IPv4 地址枚举（GetAdaptersAddresses 对齐 JS networkInterfaces） ----
 int fw_plat_local_addrs(char addrs[][48], int max) {
   ULONG sz = 15 * 1024;
   IP_ADAPTER_ADDRESSES *aa = NULL;

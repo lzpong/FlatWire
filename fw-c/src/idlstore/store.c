@@ -59,7 +59,7 @@ static idl_entry_t *load_text(fw_idlstore_t *s, const char *text, size_t len,
     fw_log(FW_LOG_ERROR, "idlstore", "IDL schema 构建失败: %s, %s", file_name, err);
     return NULL;
   }
-  // [REVIEW P3-10] 同 (svc,major) 已存在 → 拒绝重载并保留旧定义（原实现 free 旧
+  // 同 (svc,major) 已存在 → 拒绝重载并保留旧定义（原实现 free 旧
   // schema：若 local/handler 持有旧 schema 指针则悬空）。当前调用点均先 fw_idl_has
   // 防覆盖，此处为防御加固；§7.2"并存不覆盖"语义下旧定义优先
   for (int i = 0; i < s->n; i++) {

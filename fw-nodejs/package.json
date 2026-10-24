@@ -1,7 +1,7 @@
 {
   "name": "fw-nodejs",
-  "version": "4.4.0",
-  "description": "FlatWire Protocol (FW) v4.4 协议栈 —— JavaScript/Node.js 实现（零第三方依赖）",
+  "version": "5.0.0",
+  "description": "FlatWire Protocol (FW) v5.0 协议栈 —— JavaScript/Node.js 实现（裸字节编码，零第三方依赖）",
   "type": "module",
   "engines": {
     "node": ">=18"

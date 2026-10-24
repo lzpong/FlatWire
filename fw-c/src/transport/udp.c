@@ -86,7 +86,7 @@ void fw_udp_send_multicast_raw(fw_stack_t *st, int which, const uint8_t *buf, ui
   fw_udp_sendto_raw(st, st->mcast, st->cfg.port, which, buf, len);
 }
 
-// [REVIEW P3-7] 编码缓冲对齐 rpc.c 堆回退模式：栈缓冲 2048B 仅作快速路径，
+// 编码缓冲对齐 rpc.c 堆回退模式：栈缓冲 2048B 仅作快速路径，
 // 超缓冲改堆编码并正确发送（原实现直接报 FW_ERR_PARAM，与"超 PLB 界"语义混淆，
 // 且 IDL 级 max_payload 缺失时合法大帧被误拒）
 int fw_udp_send_frame(fw_stack_t *st, const fw_frame_desc_t *d, const char *addr, uint16_t port, int which) {
@@ -103,7 +103,7 @@ int fw_udp_send_frame(fw_stack_t *st, const fw_frame_desc_t *d, const char *addr
   uint32_t n = fw_frame_encode(buf, need, d);
   int rc = FW_OK;
   if (n) fw_udp_sendto_raw(st, addr, port, which, buf, n);
-  else rc = FW_ERR_ENCODE; // [REVIEW P3-7] 编码失败语义（原误报 FW_ERR_PARAM）
+  else rc = FW_ERR_ENCODE; // 编码失败语义（原误报 FW_ERR_PARAM）
   free(heap);
   return rc;
 }

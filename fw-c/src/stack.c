@@ -76,7 +76,7 @@ int fw_config_validate(const fw_config_t *cfg, char *err, int errsz) {
     snprintf(err, (size_t)errsz, "retransmit_max must be 0~20");
     return FW_ERR_CONFIG;
   }
-  // [REVIEW P3-4] ver 合法性校验：VER 为 2bit 帧字段，>3 时编码 (ver & 0x03) 截断，
+  // ver 合法性校验：VER 为 2bit 帧字段，>3 时编码 (ver & 0x03) 截断，
   // 本端自发自收解析 VER 不等（RST(0x22)/静默丢弃）且难以排查
   if (cfg->ver > 3) {
     snprintf(err, (size_t)errsz, "ver must be 0~3 (2-bit frame field)");
@@ -126,7 +126,7 @@ void fw_waiters_fire(fw_stack_t *st, fw_waiter_t **head) {
     fw_waiter_t *nx = w->next;
     w->next = NULL;
     if (w->kind == FW_W_CALL) fw_call_advance(st, w->ctx);
-    // [REVIEW P3-5] 移除 FW_W_REG 分支（reg_ctx 死代码已删除）
+    // 移除 FW_W_REG 分支（reg_ctx 死代码已删除）
     w = nx;
   }
 }
@@ -186,7 +186,7 @@ int fw_stack_init(fw_stack_t **out, const fw_config_t *cfg) {
   snprintf(st->idl_dir, sizeof(st->idl_dir), "%s", cfg->idl_dir ? cfg->idl_dir : "./idl");
   snprintf(st->mcast, sizeof(st->mcast), "%s", cfg->multicast_ipv4 ? cfg->multicast_ipv4 : "224.0.1.187");
   snprintf(st->bind, sizeof(st->bind), "%s", cfg->bind_address ? cfg->bind_address : "");
-  // 自我回环过滤地址集（§2；[REVIEW P3-11] 对齐 JS networkInterfaces 全量收集）：
+  // 自我回环过滤地址集（§2；对齐 JS networkInterfaces 全量收集）：
   //   指定 bind_address → 该地址是本 socket 唯一可能源（不混入枚举集：同机多栈
   //   绑不同网卡地址时，混入会把其他栈的帧误判为自我回环）
   //   未指定 → 平台枚举本机全部 IPv4 地址 + 回环兜底（Windows GetAdaptersAddresses
@@ -285,7 +285,7 @@ void fw_stack_stop(fw_stack_t *st) {
   }
   fw_log(FW_LOG_INFO, "stack", "REN x3 sent (graceful shutdown)");
   fw_disc_stop(st);
-  // [REVIEW P3-12] stop 时冲刷挂起 async call：以 FW_ERR_STATE 触发完成回调
+  // stop 时冲刷挂起 async call：以 FW_ERR_STATE 触发完成回调
   //（原实现 fw_rpc_free 直接释放 ctx，应用侧异步等待无终态通知 = 永久悬挂）
   fw_rpc_flush_all_pending(st, FW_ERR_STATE, "stack stopped (call aborted)");
   fw_rpc_free(st);
@@ -340,7 +340,7 @@ int fw_stack_poll(fw_stack_t *st, int timeout_ms) {
   fw_tcp_poll(st); // accept / connect 完成 / 逐连接非阻塞读
   st->dispatch--;
   // POLLOUT 就绪的发送缓冲 flush（tcp_poll 内未覆盖写就绪场景）
-  // [REVIEW P3-3] 原 poll 前记录的 conns 数组下标在 poll 期间连接关闭 swap 后错位
+  // 原 poll 前记录的 conns 数组下标在 poll 期间连接关闭 swap 后错位
   //（flush 到另一连接）：改按 fd 重查（fd 恒定，句柄复用极端场景 flush 也无害）
   for (int i = 0; i < n; i++) {
     if ((fds[i].revents & POLLOUT) && idx[i] >= 0) {
@@ -442,7 +442,7 @@ void fw_stack_on_frame(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *met
 // 应用 API —— 服务端（§13.1）
 // ============================================================
 
-// [REVIEW P3-5] 删除 fw_reg_ctx_t/fw_reg_advance 死代码：register 的自动拉取
+// 删除 fw_reg_ctx_t/fw_reg_advance 死代码：register 的自动拉取
 // 实际走 fw_disc_fetch_idl 同步泵（见 fw_register_service），reg ctx 状态机无调用方
 
 int fw_register_service(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,

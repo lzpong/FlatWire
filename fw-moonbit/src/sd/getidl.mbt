@@ -127,7 +127,7 @@ fn Sd::fail_query(self : Sd, q : IdlQuery, err : @errors.FwError) -> Unit {
 fn Sd::handle_getidl_resp(self : Sd, f : @frame.Frame, conn_id : Int) -> Unit {
   let key = "\{conn_id}|\{f.strm_id}"
   match self.idl_queries.get(key) {
-    // 非活跃查询 StrmID 的 0x11 静默丢弃（v4.4 定案：迟到帧规则）
+    // 非活跃查询 StrmID 的 0x11 静默丢弃（迟到帧规则）
     None => ()
     Some(q) => {
       if q.finished {

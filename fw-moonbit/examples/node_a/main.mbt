@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 // node_a —— 示例服务端：注册 VehicleState 服务实例（实现计划 §5）
 //
 // 场景（与 fw-nodejs/examples/node-a.js 行为对齐）：
@@ -69,32 +69,25 @@ fn run_for_ms() -> Int {
   -1
 }
 
-/// 车辆状态业务模型（§11.1 VehicleState 8 字段：veh_md/usg_md/sys_pwr_md/timestamp/
-/// timestr/status_msg/diag_note(optional)/ratio；mut 字段由 handler/周期推送更新）
+/// 车辆状态业务模型（§11.1 VehicleState 7 字段：veh_md/usg_md/sys_pwr_md/timestamp/
+/// timestr/status_msg/ratio；mut 字段由 handler/周期推送更新）
 priv struct VState {
-  mut veh_md : Int64 // unsigned(1)（FWValue 无符号值统一 Int64 承载，§9.2）
-  mut usg_md : Int64 // unsigned(1)
-  mut sys_pwr_md : Int64 // signed(1)
-  mut ts : Int64 // timestamp（毫秒，§9.1）
-  mut ratio : Double // float64
-  mut diag_note : String // optional 字段："" 编码为 null（§9.2；UpdateState 可写回）
+  mut veh_md : Int64 // u8（FWValue 无符号值统一 Int64 承载，§9.2）
+  mut usg_md : Int64 // u8
+  mut sys_pwr_md : Int64 // i8
+  mut ts : Int64 // timestamp（毫秒，§9.2）
+  mut ratio : Double // f64
 }
 
-/// 状态 → FWValue 字段值序列（8 字段按 IDL 顺序；§9.3 struct 值 = VArray）
+/// 状态 → FWValue 字段值序列（7 字段按 IDL 顺序；§9.4 struct 值 = VArray）
 fn veh_values(st : VState) -> Array[@codec.FWValue] {
   [
-    @codec.VUnsigned(st.veh_md),
-    @codec.VUnsigned(st.usg_md),
-    @codec.VSigned(st.sys_pwr_md),
+    @codec.VUInt(st.veh_md),
+    @codec.VUInt(st.usg_md),
+    @codec.VSInt(st.sys_pwr_md),
     @codec.VTimestamp(st.ts),
     @codec.VString("2026-10-13T12:00:00Z"), // fixed_len=20，恰 20 字节
     @codec.VString("all systems nominal"), // max_len=64
-    // optional 字段：空串 → null（1B 空头，§9.2）；非空 → VString
-    if st.diag_note.length() == 0 {
-      @codec.VNull
-    } else {
-      @codec.VString(st.diag_note)
-    },
     @codec.VFloat(st.ratio),
   ]
 }
@@ -114,7 +107,7 @@ fn push_tick(
   state.ts = app_now_ms(0).to_int64()
   state.ratio = (seq % 10).to_double() * 0.1
   stack.notify(4096, 1, 32769, [@codec.VArray(veh_values(state))]) // event output=VehicleState
-  stack.notify(4096, 1, 32770, [@codec.VUnsigned(2)]) // event output=PowerMode（enum 线格式=底层整型 2=Run，§11.1）
+  stack.notify(4096, 1, 32770, [@codec.VUInt(2)]) // event output=PowerMode（enum 线格式=base 整型 2=Run，§9.2）
   seq_slot[0] = seq + 1
   let _ = app_set_timeout(fn(_x) { push_tick(stack, state, seq_slot, stopped) }, 3000)
 }
@@ -151,10 +144,9 @@ fn main {
     sys_pwr_md: 2L,
     ts: app_now_ms(0).to_int64(),
     ratio: 0.618,
-    diag_note: "",
   }
   // ---- 注册服务（§13.1：本地 IDL 命中 → 同步注册 → Offering）----
-  // handler 值语义：on_request 返回 [VArray(8 字段值)]（output=VehicleState struct，§9.3）
+  // handler 值语义：on_request 返回 [VArray(7 字段值)]（output=VehicleState struct，§9.4）
   stack.register_service(4096, 1, {
     on_request: fn(if_id, _args) {
       if if_id == 1 {
@@ -168,29 +160,24 @@ fn main {
     },
     on_ff: fn(if_id, args) {
       if if_id == 2 {
-        // UpdateState：args = [VArray(8 字段值)]（input=[VehicleState]，§9.3 struct 参数）
+        // UpdateState：args = [VArray(7 字段值)]（input=[VehicleState]，§9.4 struct 参数）
         match args.get(0) {
           Some(@codec.VArray(vals)) =>
-            if vals.length() == 8 {
-              // 写回本地状态（字段序按 §11.1：0 veh_md / 1 usg_md / 2 sys_pwr_md / 6 diag_note / 7 ratio）
+            if vals.length() == 7 {
+              // 写回本地状态（字段序按 §11.1：0 veh_md / 1 usg_md / 2 sys_pwr_md / 6 ratio）
               match vals[0] {
-                @codec.VUnsigned(v) => state.veh_md = v
+                @codec.VUInt(v) => state.veh_md = v
                 _ => ()
               }
               match vals[1] {
-                @codec.VUnsigned(v) => state.usg_md = v
+                @codec.VUInt(v) => state.usg_md = v
                 _ => ()
               }
               match vals[2] {
-                @codec.VSigned(v) => state.sys_pwr_md = v
+                @codec.VSInt(v) => state.sys_pwr_md = v
                 _ => ()
               }
               match vals[6] {
-                @codec.VString(s) => state.diag_note = s
-                @codec.VNull => state.diag_note = ""
-                _ => ()
-              }
-              match vals[7] {
                 @codec.VFloat(v) => state.ratio = v
                 _ => ()
               }

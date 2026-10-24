@@ -1,4 +1,5 @@
 import {
+  "moonbitlang/core/buffer",
   "flatwire/fw/src/codec",
   "flatwire/fw/src/errors",
   "flatwire/fw/src/frame",

@@ -10,9 +10,9 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
-#include <ifaddrs.h> // [REVIEW P3-11] getifaddrs
+#include <ifaddrs.h> // getifaddrs
 #if defined(__linux__)
-  #include <sys/random.h> // [REVIEW P3-1] getrandom
+  #include <sys/random.h> // getrandom
 #endif
 
 // ---- socket 基础 ----
@@ -87,7 +87,7 @@ void fw_sleep_ms(int ms) {
   while (nanosleep(&req, &req) == -1 && errno == EINTR) { /* 重试剩余时长 */ }
 }
 
-// ---- 平台随机（§10 MSK key；[REVIEW P3-1] getrandom() / /dev/urandom 替换时钟推导） ----
+// ---- 平台随机（§10 MSK key；getrandom() / /dev/urandom 替换时钟推导） ----
 void fw_plat_random_bytes(uint8_t *buf, int n) {
 #if defined(__linux__) && defined(GRND_NONBLOCK)
   if (getrandom(buf, (size_t)n, 0) == n) return;
@@ -107,7 +107,7 @@ void fw_plat_random_bytes(uint8_t *buf, int n) {
   }
 }
 
-// ---- 本机 IPv4 地址枚举（[REVIEW P3-11] getifaddrs 对齐 JS networkInterfaces） ----
+// ---- 本机 IPv4 地址枚举（getifaddrs 对齐 JS networkInterfaces） ----
 int fw_plat_local_addrs(char addrs[][48], int max) {
 #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
   struct ifaddrs *ifa = NULL;

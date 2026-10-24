@@ -87,7 +87,7 @@ pub fn Stack::notify(
     None => st_log_error("[stack] notify: interface missing svc=\{svc_id} if=\{if_id}")
     Some(iface) =>
       try {
-        let body = @codec.encode_fields(wrap_output(iface.output), values)
+        let body = encode_iface(wrap_output(iface.output), values, iface.crc)
         self.events.notify(svc_id, inst_id, if_id, body)
       } catch {
         e => st_log_error("[stack] notify codec error: svc=\{svc_id} if=\{if_id} \{Repr(e)}")
@@ -118,7 +118,7 @@ pub fn Stack::call(
           None => on_err(@errors.IdlMissing("interface \{svc_id}.\{if_id} not in IDL store"))
           Some(iface) =>
             try {
-              let body = @codec.encode_fields(wrap_input(iface.input), values)
+              let body = encode_iface(wrap_input(iface.input), values, iface.crc)
               self.rpc.call(
                 pi.peer,
                 pi.port,
@@ -129,8 +129,8 @@ pub fn Stack::call(
                 body,
                 timeout_ms,
                 fn(bytes) {
-                  // 响应按 output 解码（iface CType 树不可变，安全捕获）
-                  match decode_output(iface.output, bytes) {
+                  // 响应按 output 解码（iface CType 树不可变，安全捕获；CRC 开关随接口）
+                  match decode_output(iface.output, bytes, iface.crc) {
                     Ok(vs) => on_ok(vs)
                     Err(msg) => on_err(@errors.Local(msg))
                   }
@@ -162,7 +162,7 @@ pub fn Stack::fire_forget(
           None => on_err(@errors.IdlMissing("interface \{svc_id}.\{if_id} not in IDL store"))
           Some(iface) =>
             try {
-              let body = @codec.encode_fields(wrap_input(iface.input), values)
+              let body = encode_iface(wrap_input(iface.input), values, iface.crc)
               self.rpc.fire_forget(
                 pi.peer,
                 pi.port,
@@ -200,7 +200,7 @@ pub fn Stack::subscribe(
     match self.iface_of_any(svc_id, if_id) {
       None => st_log_error("[stack] event deliver: interface missing svc=\{svc_id} if=\{if_id}")
       Some(iface) =>
-        match decode_output(iface.output, bytes) {
+        match decode_output(iface.output, bytes, iface.crc) {
           Ok(vs) => on_event(if_id, vs)
           Err(msg) => st_log_error("[stack] event deliver codec error: if=\{if_id} \{msg}")
         }

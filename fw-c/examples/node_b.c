@@ -109,7 +109,6 @@ int main(int argc, char **argv) {
   fw_struct_set(st1, "timestamp", fw_value_uint(0));
   fw_struct_set(st1, "timestr", fw_value_string("2026-10-13T12:30:00Z"));
   fw_struct_set(st1, "status_msg", fw_value_string("updated by NodeB"));
-  fw_struct_set(st1, "diag_note", fw_value_string("demo")); // optional 有值
   fw_struct_set(st1, "ratio", fw_value_float(0.717));
   if (fw_fire_forget(g_stack, 4096, 1, 2, st1) != FW_OK) {
     fprintf(stderr, "[NodeB] fire_forget UpdateState failed: %s\n", fw_stack_last_error(g_stack)->msg);

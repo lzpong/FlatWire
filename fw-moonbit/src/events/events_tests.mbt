@@ -1,4 +1,4 @@
-﻿// 事件层 inline 测试（同包访问 priv 字段：cache / out_cons / recv_seen / client_subs）
+// 事件层 inline 测试（同包访问 priv 字段：cache / out_cons / recv_seen / client_subs）
 //
 // 服务端订阅记录经 sd 层真实入口建立（offer_start 注册本地实例 + Subscribe CON 控制帧
 // → on_udp_ctrl → server_subs 登记 + SubEstablished 上抛），与集成路径一致；
@@ -42,6 +42,7 @@ fn put_event_iface(ev : Events, svc_id : Int, if_id : Int, reliable : Bool) -> U
         tcp: false,
         max_payload: 0,
         reliable,
+        crc: false,
         input: [],
         output: None,
       },

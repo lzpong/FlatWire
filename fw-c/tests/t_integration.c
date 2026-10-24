@@ -22,10 +22,9 @@ static const char *IDL_TEXT =
 "{\"name\":\"Chg\",\"if_id\":32769,\"type\":\"event\",\"transport\":\"udp\",\"output\":\"State\",\"reliable\":false}"
 "]},"
 "\"type_def\":{\"structs\":{\"State\":["
-"{\"name\":\"a\",\"type\":\"unsigned\",\"size\":2},"
-"{\"name\":\"b\",\"type\":\"signed\",\"size\":1},"
-"{\"name\":\"msg\",\"type\":\"string\",\"max_len\":16},"
-"{\"name\":\"opt\",\"type\":\"string\",\"max_len\":8,\"optional\":true}"
+"{\"name\":\"a\",\"type\":\"u16\"},"
+"{\"name\":\"b\",\"type\":\"i8\"},"
+"{\"name\":\"msg\",\"type\":\"string\",\"max_len\":16}"
 "]}}}";
 
 static int call_done = 0;
@@ -43,12 +42,11 @@ static int wait_avail2(fw_stack_t *a, fw_stack_t *st, uint16_t svc, uint8_t inst
   return 0;
 }
 
-static fw_value_t *make_state(uint32_t a, int b, const char *msg, const char *opt) {
+static fw_value_t *make_state(uint32_t a, int b, const char *msg) {
   fw_value_t *v = fw_value_struct();
   fw_struct_set(v, "a", fw_value_uint(a));
   fw_struct_set(v, "b", fw_value_int(b));
   fw_struct_set(v, "msg", fw_value_string(msg));
-  if (opt) fw_struct_set(v, "opt", fw_value_string(opt));
   return v;
 }
 
@@ -62,7 +60,7 @@ static fw_stack_t *g_a = NULL;
 static int on_request(void *ud, uint16_t if_id, const fw_value_t *payload, fw_value_t **out) {
   (void)ud; (void)payload;
   if (if_id != 1) return 1;
-  *out = make_state(g_srv_a, g_srv_b, g_srv_msg, NULL); // 响应所有权转移协议栈
+  *out = make_state(g_srv_a, g_srv_b, g_srv_msg); // 响应所有权转移协议栈
   return FW_OK;
 }
 
@@ -75,7 +73,7 @@ static void on_ff(void *ud, uint16_t if_id, const fw_value_t *payload) {
   if (a) g_srv_a = (uint32_t)a->as.u;
   if (msg) snprintf(g_srv_msg, sizeof(g_srv_msg), "%s", msg->as.s.ptr);
   // 状态变更即推送（§8.2）
-  fw_notify(g_a, 5000, 1, 32769, make_state(g_srv_a, g_srv_b, g_srv_msg, NULL));
+  fw_notify(g_a, 5000, 1, 32769, make_state(g_srv_a, g_srv_b, g_srv_msg));
 }
 
 // ---- 客户端事件计数 ----
@@ -175,7 +173,7 @@ int suite_integration(void) {
 
   // fire_forget（7.4：服务端处理 + 触发推送）——FF 无响应，服务端 handler 在
   // A 的 poll 中执行（fire-and-forget），发送后泵两栈等待处理完成再断言
-  r = fw_fire_forget(b, 5000, 1, 2, make_state(777, -5, "from-b", "o"));
+  r = fw_fire_forget(b, 5000, 1, 2, make_state(777, -5, "from-b"));
   CHECK_EQ_INT(r, FW_OK);
   int ff_deadline = 0;
   int64_t ff_dl = fw_now_ms() + 5000;

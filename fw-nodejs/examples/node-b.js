@@ -69,7 +69,7 @@ console.log('[VERIFY-3] rpc GetState →', JSON.stringify(ret));
 // 4. fire_forget（TCP 全 NON，无传输确认，§5.2）
 await stack.fire_forget(4096, 1, 2, {
   veh_md: 1, usg_md: 2, sys_pwr_md: 3, timestamp: Date.now(),
-  timestr: '2026-10-13T12:30:00Z', status_msg: 'updated by NodeB', diag_note: 'demo', ratio: 0.717,
+  timestr: '2026-10-13T12:30:00Z', status_msg: 'updated by NodeB', ratio: 0.717,
 });
 await stack.fire_forget(4096, 1, 3, {
   vin: Buffer.from('LFV3A23C8K3123456', 'utf8'), // 17B 定长 bytes

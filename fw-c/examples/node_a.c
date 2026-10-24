@@ -43,7 +43,6 @@ static int on_request(void *ud, uint16_t if_id, const fw_value_t *payload, fw_va
     fw_struct_set(v, "timestamp", fw_value_uint(now_unix_ms()));
     fw_struct_set(v, "timestr", fw_value_string(g_state.timestr)); // fixed_len=20 恰 20 字节
     fw_struct_set(v, "status_msg", fw_value_string(g_state.status_msg));
-    // diag_note optional 缺省 → null（§9.2）
     fw_struct_set(v, "ratio", fw_value_float(g_state.ratio));
     *out = v; // 响应所有权转移协议栈
     return FW_OK;
@@ -60,7 +59,7 @@ static void on_fire_forget(void *ud, uint16_t if_id, const fw_value_t *payload) 
     if (pwr) g_state.sys_pwr_md = (int)pwr->as.i;
     if (msg) snprintf(g_state.status_msg, sizeof(g_state.status_msg), "%s", msg->as.s.ptr);
     printf("[NodeA] ff UpdateState: sys_pwr_md=%d status=\"%s\"\n", g_state.sys_pwr_md, g_state.status_msg);
-    // 状态变更即推送（§8.2；diag_note 保持缺省 null）
+    // 状态变更即推送（§8.2）
     fw_value_t *ev = fw_value_struct();
     fw_struct_set(ev, "veh_md", fw_value_uint(g_state.veh_md));
     fw_struct_set(ev, "usg_md", fw_value_uint(g_state.usg_md));

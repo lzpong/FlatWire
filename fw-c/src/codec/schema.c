@@ -1,5 +1,9 @@
 // ============================================================
-// schema.c —— IDL 解析（§11.1）与类型解析（resolve 递归展开）
+// schema.c —— IDL 解析（§11.1 v5.0）与类型解析（resolve 递归展开）
+//
+// v5.0 类型白名单（§9.2）：u8/u16/u32/u64、i8/i16/i32/i64、f32/f64/f80、
+// bool、timestamp、enum（base 整型，默认 u8）、string/bytes/array（必须声明
+// fixed_len 或 max_len 之一）、struct。不存在 optional / size / width。
 //
 // 内存模型：
 //   - 命名类型（structs/enums/arrays）→ schema->cache 统一持有（owned=0）
@@ -13,17 +17,54 @@
 #include <string.h>
 #include <stdio.h>
 
-// 基础字段类型名（IDL 字段 type 直接使用，§9.1）；返回 0 = 类型名引用
-static int basic_type_kind(const char *t) {
+// 标量类型名 → 类型种类（§9.2 白名单）；返回 0 = 非标量（类型名引用或非法）
+static int scalar_type_kind(const char *t) {
   if (!t) return 0;
+  if (strcmp(t, "u8") == 0)  return FW_T_U8;
+  if (strcmp(t, "u16") == 0) return FW_T_U16;
+  if (strcmp(t, "u32") == 0) return FW_T_U32;
+  if (strcmp(t, "u64") == 0) return FW_T_U64;
+  if (strcmp(t, "i8") == 0)  return FW_T_I8;
+  if (strcmp(t, "i16") == 0) return FW_T_I16;
+  if (strcmp(t, "i32") == 0) return FW_T_I32;
+  if (strcmp(t, "i64") == 0) return FW_T_I64;
+  if (strcmp(t, "f32") == 0) return FW_T_F32;
+  if (strcmp(t, "f64") == 0) return FW_T_F64;
+  if (strcmp(t, "f80") == 0) return FW_T_F80;
   if (strcmp(t, "bool") == 0)      return FW_T_BOOL;
-  if (strcmp(t, "signed") == 0)    return FW_T_SIGNED;
-  if (strcmp(t, "unsigned") == 0)  return FW_T_UNSIGNED;
-  if (strcmp(t, "float") == 0)     return FW_T_FLOAT;
   if (strcmp(t, "timestamp") == 0) return FW_T_TIMESTAMP;
   if (strcmp(t, "string") == 0)    return FW_T_STRING;
   if (strcmp(t, "bytes") == 0)     return FW_T_BYTES;
   return 0;
+}
+
+// 标量线上宽度（字节，§9.2）；string/bytes 返回 0（由 fixed_len/max_len 定界）
+static int scalar_size(int kind) {
+  switch (kind) {
+    case FW_T_U8: case FW_T_I8: case FW_T_BOOL: return 1;
+    case FW_T_U16: case FW_T_I16: return 2;
+    case FW_T_U32: case FW_T_I32: case FW_T_F32: return 4;
+    case FW_T_U64: case FW_T_I64: case FW_T_F64: return 8;
+    case FW_T_TIMESTAMP: return 6;
+    case FW_T_F80: return 10;
+    default: return 0;
+  }
+}
+
+// enum base 类型名 → 整型种类（§9.2：u8/u16/u32/u64/i8/i16/i32/i64）
+static int enum_base_kind(const char *t) {
+  int k = scalar_type_kind(t);
+  switch (k) {
+    case FW_T_U8: case FW_T_U16: case FW_T_U32: case FW_T_U64:
+    case FW_T_I8: case FW_T_I16: case FW_T_I32: case FW_T_I64:
+      return k;
+    default:
+      return 0;
+  }
+}
+
+static int enum_base_signed(int kind) {
+  return kind == FW_T_I8 || kind == FW_T_I16 || kind == FW_T_I32 || kind == FW_T_I64;
 }
 
 // ---- JSON 取值助手 ----
@@ -42,6 +83,10 @@ static int jbool(const fw_value_t *o, const char *key, int dflt) {
   const fw_value_t *v = fw_struct_get(o, key);
   if (v && v->type == FW_V_BOOL) return v->as.b;
   return dflt;
+}
+// 键是否存在于对象（用于拒绝 v5 已删除的属性）
+static int jhas(const fw_value_t *o, const char *key) {
+  return o && o->type == FW_V_STRUCT && fw_struct_get(o, key) != NULL;
 }
 
 // ---- tdesc 分配 ----
@@ -91,7 +136,7 @@ static fw_tdesc_t *resolve_depth(fw_schema_t *s, const char *name, int depth) {
   if (!def) return NULL;
 
   if (def->kind == 0) {
-    // 结构体：N 个字段的有序组合（§9.3）
+    // 结构体：N 个字段按 schema 顺序裸排（§9.4）
     fw_tdesc_t *t = tdesc_new(FW_T_STRUCT, name, 0);
     if (!t) return NULL;
     t->field_n = def->field_n;
@@ -101,30 +146,36 @@ static fw_tdesc_t *resolve_depth(fw_schema_t *s, const char *name, int depth) {
     for (int i = 0; i < def->field_n; i++) {
       fw_tfield_t *f = &t->fields[i];
       snprintf(f->name, sizeof(f->name), "%s", def->fields[i].name);
-      f->optional = def->fields[i].optional;
       const char *ft = def->fields[i].type;
       if (strcmp(ft, "array") == 0) {
-        // 内联数组字段定义（element_type 引用其他类型，§11.1/§9.3）
+        // 内联数组字段（element_type 可为标量或类型名，§11.1/§9.4）
         fw_tdesc_t *el = tdesc_new(FW_T_ARRAY, "", 1);
         if (!el) return NULL;
         el->fixed_len = def->fields[i].fixed_len;
         el->max_len = def->fields[i].max_len;
-        el->element = resolve_depth(s, def->fields[i].element_type, depth + 1);
-        if (!el->element) { free(el); return NULL; }
+        int ebk = scalar_type_kind(def->fields[i].element_type);
+        if (ebk != 0) {
+          fw_tdesc_t *ee = tdesc_new(ebk, def->fields[i].element_type, 1);
+          if (!ee) { free(el); return NULL; }
+          ee->size = scalar_size(ebk);
+          el->element = ee;
+        } else {
+          el->element = resolve_depth(s, def->fields[i].element_type, depth + 1);
+          if (!el->element) { free(el); return NULL; }
+        }
         f->type = el;
       } else {
-        int bk = basic_type_kind(ft);
+        int bk = scalar_type_kind(ft);
         if (bk != 0) {
-          // 基础类型字段（直接展开，§9.1）
+          // 标量字段（宽度由类型静态确定，§9.2）
           fw_tdesc_t *bt = tdesc_new(bk, ft, 1);
           if (!bt) return NULL;
-          bt->size = def->fields[i].size;
-          bt->width = def->fields[i].width;
+          bt->size = scalar_size(bk);
           bt->fixed_len = def->fields[i].fixed_len;
           bt->max_len = def->fields[i].max_len;
           f->type = bt;
         } else {
-          // 类型名引用（struct/enum/array 定义名）——展开并保留字段名与 optional（§11.1）
+          // 类型名引用（struct/enum/array 定义名）
           f->type = resolve_depth(s, ft, depth + 1);
           if (!f->type) return NULL;
         }
@@ -133,14 +184,13 @@ static fw_tdesc_t *resolve_depth(fw_schema_t *s, const char *name, int depth) {
     return t;
   }
   if (def->kind == 1) {
-    // 枚举：线格式 = 底层整型（§11.1）
+    // 枚举：线格式 = base 整型裸值（§9.2）
     fw_tdesc_t *t = tdesc_new(FW_T_ENUM, name, 0);
     if (!t) return NULL;
-    t->enum_base = (strcmp(def->base, "signed") == 0) ? FW_T_SIGNED : FW_T_UNSIGNED;
+    t->enum_base = enum_base_signed(enum_base_kind(def->base));
     t->size = def->size;
     t->enum_n = def->val_n;
-    // [REVIEW P3-6] enum_vals 改为拷贝：消除 tdesc 布局与 fw_typedef_t.vals
-    // 必须逐字节一致的脆弱耦合（原实现直接指向 typedef.vals）
+    // enum_vals 为独立拷贝：随 cache 释放
     t->enum_vals = NULL;
     if (def->val_n > 0) {
       t->enum_vals = (void *)malloc((size_t)def->val_n * sizeof(*t->enum_vals));
@@ -151,13 +201,21 @@ static fw_tdesc_t *resolve_depth(fw_schema_t *s, const char *name, int depth) {
     return t;
   }
   if (def->kind == 2) {
-    // 数组类型：element_type 可为 struct/array/enum（任意嵌套，§9.3/§11.1）
+    // 数组类型：element_type 可为标量/struct/array/enum（任意嵌套 §9.4）
     fw_tdesc_t *t = tdesc_new(FW_T_ARRAY, name, 0);
     if (!t) return NULL;
     t->fixed_len = def->fixed_len;
     t->max_len = def->max_len;
     if (!cache_add(s, name, t)) { free(t); return NULL; }
-    t->element = resolve_depth(s, def->element_type, depth + 1);
+    int bk = scalar_type_kind(def->element_type);
+    if (bk != 0) {
+      fw_tdesc_t *el = tdesc_new(bk, def->element_type, 1);
+      if (!el) return NULL;
+      el->size = scalar_size(bk);
+      t->element = el;
+    } else {
+      t->element = resolve_depth(s, def->element_type, depth + 1);
+    }
     if (!t->element) return NULL;
     return t;
   }
@@ -201,33 +259,198 @@ static int def_add(fw_schema_t *s, const char *name, int kind) {
   return 1;
 }
 
-// struct 字段原始定义录入
-static int build_field_def(fw_typedef_t *d, const fw_value_t *jf) {
-  if (jf->type != FW_V_STRUCT) return 0;
+// 长度声明校验（§9.3）：string/bytes/array 必须且只能声明 fixed_len 或 max_len 之一
+static int check_len_decl(const fw_value_t *jf, int *fixed_len, int *max_len,
+                          const char *fname, const char *tname, char *err, int errsz) {
+  int has_fixed = jhas(jf, "fixed_len");
+  int has_max = jhas(jf, "max_len");
+  if (has_fixed && has_max) {
+    snprintf(err, (size_t)errsz, "field \"%s\": %s must not declare both fixed_len and max_len",
+             fname, tname);
+    return 0;
+  }
+  if (!has_fixed && !has_max) {
+    snprintf(err, (size_t)errsz, "field \"%s\": %s requires fixed_len or max_len",
+             fname, tname);
+    return 0;
+  }
+  int64_t fl = has_fixed ? jint(jf, "fixed_len", -1) : -1;
+  int64_t ml = has_max ? jint(jf, "max_len", -1) : -1;
+  if (has_fixed && fl < 0) {
+    snprintf(err, (size_t)errsz, "field \"%s\": fixed_len must be >= 0", fname);
+    return 0;
+  }
+  if (has_max && ml < 0) {
+    snprintf(err, (size_t)errsz, "field \"%s\": max_len must be >= 0", fname);
+    return 0;
+  }
+  if (fl > INT32_MAX || ml > INT32_MAX) {
+    snprintf(err, (size_t)errsz, "field \"%s\": length declaration too large", fname);
+    return 0;
+  }
+  *fixed_len = (int)fl;
+  *max_len = (int)ml;
+  return 1;
+}
+
+// struct 字段原始定义录入（v5.0：拒绝 optional/size/width；强制长度声明）
+static int build_field_def(fw_typedef_t *d, const fw_value_t *jf, char *err, int errsz) {
+  if (jf->type != FW_V_STRUCT) {
+    snprintf(err, (size_t)errsz, "struct field must be an object");
+    return 0;
+  }
+  const char *fname = jstr(jf, "name", "?");
   const char *tname = jstr(jf, "type", NULL);
-  if (!tname) return 0;
+  if (!tname) {
+    snprintf(err, (size_t)errsz, "field \"%s\": missing type", fname);
+    return 0;
+  }
+  // v5.0 类型独立化：不存在 optional / size / width（§11.1）
+  if (jhas(jf, "optional")) {
+    snprintf(err, (size_t)errsz, "field \"%s\": optional is not supported in v5", fname);
+    return 0;
+  }
+  if (jhas(jf, "size") || jhas(jf, "width")) {
+    snprintf(err, (size_t)errsz, "field \"%s\": size/width is not supported in v5 (use type names)",
+             fname);
+    return 0;
+  }
+
+  int bk = scalar_type_kind(tname);
+  int is_array = (strcmp(tname, "array") == 0);
+  int needs_len = is_array || bk == FW_T_STRING || bk == FW_T_BYTES;
+
+  int fixed_len = -1, max_len = -1;
+  if (bk == FW_T_F80) {
+    // 可选扩展：本端不支持 → IDL 加载失败（§9.2/测试 1.12）
+    snprintf(err, (size_t)errsz, "field \"%s\": f80 is not supported by this implementation", fname);
+    return 0;
+  }
+  if (needs_len) {
+    if (!check_len_decl(jf, &fixed_len, &max_len, fname, tname, err, errsz)) return 0;
+  } else if (jhas(jf, "fixed_len") || jhas(jf, "max_len")) {
+    // 长度声明仅对 string/bytes/array 有意义（§9.3）
+    snprintf(err, (size_t)errsz, "field \"%s\": fixed_len/max_len only valid for string/bytes/array",
+             fname);
+    return 0;
+  }
+  char element_type[64] = "";
+  if (is_array) {
+    const char *et = jstr(jf, "element_type", NULL);
+    if (!et || !et[0]) {
+      snprintf(err, (size_t)errsz, "field \"%s\": array requires element_type", fname);
+      return 0;
+    }
+    if (strcmp(et, "array") == 0) {
+      snprintf(err, (size_t)errsz,
+               "field \"%s\": nested array must reference a named array type", fname);
+      return 0;
+    }
+    snprintf(element_type, sizeof(element_type), "%s", et);
+  }
+
   if (d->field_n == d->field_cap) {
     int nc = d->field_cap ? d->field_cap * 2 : 8;
     void *np = realloc(d->fields, (size_t)nc * sizeof(*d->fields));
-    if (!np) return 0;
+    if (!np) {
+      snprintf(err, (size_t)errsz, "out of memory");
+      return 0;
+    }
     d->fields = np;
     d->field_cap = nc;
   }
+  // fw_typedef_t.fields 的匿名结构体成员：使用同布局占位类型访问
   typedef struct { char name[64]; char type[64]; char element_type[64];
-                   int optional, size, width, fixed_len, max_len; } field_t;
+                   int fixed_len, max_len; } field_t;
   field_t *f = &((field_t *)d->fields)[d->field_n];
   memset(f, 0, sizeof(*f));
-  snprintf(f->name, sizeof(f->name), "%s", jstr(jf, "name", "?"));
+  snprintf(f->name, sizeof(f->name), "%s", fname);
   snprintf(f->type, sizeof(f->type), "%s", tname);
-  // 内联数组字段的元素类型（type=="array" 时使用，§11.1）
-  if (strcmp(tname, "array") == 0)
-    snprintf(f->element_type, sizeof(f->element_type), "%s", jstr(jf, "element_type", ""));
-  f->optional = jbool(jf, "optional", 0);
-  f->size = (int)jint(jf, "size", 0);
-  f->width = (int)jint(jf, "width", 0);
-  f->fixed_len = (int)jint(jf, "fixed_len", -1);
-  f->max_len = (int)jint(jf, "max_len", -1);
+  snprintf(f->element_type, sizeof(f->element_type), "%s", element_type);
+  f->fixed_len = fixed_len;
+  f->max_len = max_len;
   d->field_n++;
+  return 1;
+}
+
+// enum 定义录入（base 白名单 + 值域/重复校验，§9.2/§11.1）
+static int build_enum_def(fw_typedef_t *d, const fw_value_t *je, const char *ename,
+                          char *err, int errsz) {
+  // v5.0：enum 使用 base 声明基类型，无 type/size
+  if (jhas(je, "type")) {
+    snprintf(err, (size_t)errsz, "enum \"%s\": use base instead of type", ename);
+    return 0;
+  }
+  if (jhas(je, "size")) {
+    snprintf(err, (size_t)errsz, "enum \"%s\": size is not supported in v5 (use base)", ename);
+    return 0;
+  }
+  const char *base = jstr(je, "base", "u8");
+  int bk = enum_base_kind(base);
+  if (!bk) {
+    snprintf(err, (size_t)errsz, "enum \"%s\": invalid base \"%s\"", ename, base);
+    return 0;
+  }
+  snprintf(d->base, sizeof(d->base), "%s", base);
+  d->size = scalar_size(bk);
+
+  const fw_value_t *vals = fw_struct_get(je, "values");
+  if (!vals || vals->type != FW_V_STRUCT) {
+    snprintf(err, (size_t)errsz, "enum \"%s\": values must be an object", ename);
+    return 0;
+  }
+  int vn = (int)vals->as.st.len;
+  d->vals = calloc((size_t)(vn ? vn : 1), sizeof(*d->vals));
+  if (!d->vals) {
+    snprintf(err, (size_t)errsz, "out of memory");
+    return 0;
+  }
+  d->val_n = vn;
+  for (int k = 0; k < vn; k++) {
+    snprintf(d->vals[k].name, sizeof(d->vals[k].name), "%s", vals->as.st.names[k]);
+    const fw_value_t *e = vals->as.st.vals[k];
+    if (!e || (e->type != FW_V_INT && e->type != FW_V_UINT)) {
+      snprintf(err, (size_t)errsz, "enum \"%s\": value \"%s\" must be an integer",
+               ename, vals->as.st.names[k]);
+      return 0;
+    }
+    int64_t v = (e->type == FW_V_INT) ? e->as.i : (int64_t)e->as.u;
+    // 值域校验（按 base 宽度/符号）
+    if (enum_base_signed(bk)) {
+      int64_t lo, hi;
+      if (d->size == 8) { lo = INT64_MIN; hi = INT64_MAX; }
+      else {
+        uint64_t bits = (uint64_t)d->size * 8;
+        hi = (int64_t)(((uint64_t)1 << (bits - 1)) - 1);
+        lo = -(int64_t)((uint64_t)1 << (bits - 1));
+      }
+      if (v < lo || v > hi) {
+        snprintf(err, (size_t)errsz, "enum \"%s\": value \"%s\" out of base range",
+                 ename, vals->as.st.names[k]);
+        return 0;
+      }
+    } else {
+      if (d->size < 8 && (uint64_t)v > (((uint64_t)1 << (8 * d->size)) - 1)) {
+        snprintf(err, (size_t)errsz, "enum \"%s\": value \"%s\" out of base range",
+                 ename, vals->as.st.names[k]);
+        return 0;
+      }
+      if (v < 0) {
+        snprintf(err, (size_t)errsz, "enum \"%s\": negative value with unsigned base",
+                 ename);
+        return 0;
+      }
+    }
+    // 重复值校验
+    for (int j = 0; j < k; j++) {
+      if (d->vals[j].val == v) {
+        snprintf(err, (size_t)errsz, "enum \"%s\": duplicate value %lld",
+                 ename, (long long)v);
+        return 0;
+      }
+    }
+    d->vals[k].val = v;
+  }
   return 1;
 }
 
@@ -266,7 +489,7 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
       else d->transport = (d->type == FW_IF_EVENT) ? FW_TR_UDP : FW_TR_TCP; // §11.1 默认绑定
       d->reliable = jbool(ji, "reliable", 0);
       d->max_payload = (int32_t)jint(ji, "max_payload", -1);
-      d->crc = jbool(ji, "crc", 0); // 实现约定扩展：接口契约级 CRC（§9.6）
+      d->crc = jbool(ji, "crc", 0); // 缺省关闭：仅 "crc": true 时附加 2B CRC（§9.6）
       // input：类型名数组
       const fw_value_t *in = fw_struct_get(ji, "input");
       if (in && in->type == FW_V_ARRAY && in->as.arr.len > 0) {
@@ -314,6 +537,7 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
   }
 
   // ---- type_def：structs / enums / arrays（§11.1） ----
+  char ferr[128];
   const fw_value_t *td = fw_struct_get(idl, "type_def");
   if (td && td->type == FW_V_STRUCT) {
     const fw_value_t *structs = fw_struct_get(td, "structs");
@@ -324,7 +548,7 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
         if (!def_add(s, structs->as.st.names[i], 0)) FAIL("out of memory");
         fw_typedef_t *d = &s->defs[s->def_n - 1];
         for (uint32_t k = 0; k < fl->as.arr.len; k++) {
-          if (!build_field_def(d, fl->as.arr.items[k])) FAIL("invalid struct field definition");
+          if (!build_field_def(d, fl->as.arr.items[k], ferr, sizeof(ferr))) FAIL(ferr);
         }
       }
     }
@@ -332,36 +556,39 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
     if (enums && enums->type == FW_V_STRUCT) {
       for (uint32_t i = 0; i < enums->as.st.len; i++) {
         const fw_value_t *je = enums->as.st.vals[i];
+        const char *ename = enums->as.st.names[i];
         if (je->type != FW_V_STRUCT) FAIL("enums[name] must be an object");
-        if (!def_add(s, enums->as.st.names[i], 1)) FAIL("out of memory");
+        if (!def_add(s, ename, 1)) FAIL("out of memory");
         fw_typedef_t *d = &s->defs[s->def_n - 1];
-        snprintf(d->base, sizeof(d->base), "%s", jstr(je, "type", "unsigned"));
-        d->size = (int)jint(je, "size", 1);
-        const fw_value_t *vals = fw_struct_get(je, "values");
-        if (vals && vals->type == FW_V_STRUCT) {
-          int vn = (int)vals->as.st.len;
-          d->vals = calloc((size_t)(vn ? vn : 1), sizeof(*d->vals));
-          if (!d->vals) FAIL("out of memory");
-          d->val_n = vn;
-          for (int k = 0; k < vn; k++) {
-            snprintf(d->vals[k].name, sizeof(d->vals[k].name), "%s", vals->as.st.names[k]);
-            const fw_value_t *e = vals->as.st.vals[k];
-            d->vals[k].val = (e && e->type == FW_V_UINT) ? (int64_t)e->as.u
-                           : (e && e->type == FW_V_INT ? e->as.i : 0);
-          }
-        }
+        if (!build_enum_def(d, je, ename, ferr, sizeof(ferr))) FAIL(ferr);
       }
     }
     const fw_value_t *arrays = fw_struct_get(td, "arrays");
     if (arrays && arrays->type == FW_V_STRUCT) {
       for (uint32_t i = 0; i < arrays->as.st.len; i++) {
         const fw_value_t *ja = arrays->as.st.vals[i];
+        const char *aname = arrays->as.st.names[i];
         if (ja->type != FW_V_STRUCT) FAIL("arrays[name] must be an object");
-        if (!def_add(s, arrays->as.st.names[i], 2)) FAIL("out of memory");
+        // v5.0：arrays 条目不再声明 "type":"array"
+        if (jhas(ja, "type")) {
+          snprintf(ferr, sizeof(ferr), "array \"%s\": type field is not supported in v5", aname);
+          FAIL(ferr);
+        }
+        const char *et = jstr(ja, "element_type", NULL);
+        if (!et || !et[0]) {
+          snprintf(ferr, sizeof(ferr), "array \"%s\": missing element_type", aname);
+          FAIL(ferr);
+        }
+        int fixed_len = -1, max_len = -1;
+        char lerr[128];
+        if (!check_len_decl(ja, &fixed_len, &max_len, aname, "array", lerr, sizeof(lerr))) {
+          FAIL(lerr);
+        }
+        if (!def_add(s, aname, 2)) FAIL("out of memory");
         fw_typedef_t *d = &s->defs[s->def_n - 1];
-        snprintf(d->element_type, sizeof(d->element_type), "%s", jstr(ja, "element_type", ""));
-        d->fixed_len = (int)jint(ja, "fixed_len", -1);
-        d->max_len = (int)jint(ja, "max_len", -1);
+        snprintf(d->element_type, sizeof(d->element_type), "%s", et);
+        d->fixed_len = fixed_len;
+        d->max_len = max_len;
       }
     }
   }
@@ -393,7 +620,10 @@ void fw_schema_free(fw_schema_t *s) {
       for (int k = 0; k < t->field_n; k++) free_owned_tdesc(t->fields[k].type);
       free(t->fields);
     } else if (t->kind == FW_T_ENUM) {
-      free(t->enum_vals); // [REVIEW P3-6] enum_vals 为独立拷贝，随 cache 释放
+      free(t->enum_vals); // enum_vals 为独立拷贝，随 cache 释放
+    } else if (t->kind == FW_T_ARRAY) {
+      // 数组类型的标量元素为字段级独立分配（resolve 内创建，owned=1）
+      free_owned_tdesc(t->element);
     }
     free(t);
   }

@@ -1,7 +1,7 @@
 /// §9.6 CRC-16/CCITT-FALSE
 ///
 /// 唯一变体：poly=0x1021, init=0xFFFF, refin/refout=false, xorout=0x0000
-/// 标准自检值：CRC-16/CCITT-FALSE("123456789") = 0x29B1（实现自检用，测试用例 1.31）
+/// 标准自检值：CRC-16/CCITT-FALSE("123456789") = 0x29B1（实现自检用，测试用例 1.33）
 
 /// 逐字节计算 CRC-16/CCITT-FALSE（可链式续算）
 pub fn crc16_ccitt_false_update(crc : Int, data : Bytes, offset : Int, len : Int) -> Int {
@@ -30,7 +30,7 @@ pub fn crc16_ccitt_false(data : Bytes, offset : Int, len : Int) -> Int {
   crc16_ccitt_false_update(0xFFFF, data, offset, len)
 }
 
-/// 测试：标准自检值 0x29B1（§9.6 / 测试用例 1.31）
+/// 测试：标准自检值 0x29B1（§9.6 / 测试用例 1.33）
 test "CRC-16/CCITT-FALSE self-check" {
   let input = b"123456789"
   assert_eq(crc16_ccitt_false(input, 0, input.length()), 0x29B1)

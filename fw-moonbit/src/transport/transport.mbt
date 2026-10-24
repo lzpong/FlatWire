@@ -1,6 +1,6 @@
 // §5 传输层：UDP 组播双 socket + TCP 连接管理（Node.js 运行时）
 //
-// - 双 socket（§5.2 / v4.4 终审定论）：server socket 绑定 fw_udp_port 并加入组播组
+// - 双 socket（§5.2）：server socket 绑定 fw_udp_port 并加入组播组
 //   （收组播 Offer/Find/REN + 发往该端口的单播）；client socket 绑定临时端口仅单播
 //   （收响应/确认/RST）。单实例双 socket 自洽，client socket 不收组播不影响正确性。
 // - 组播帧判定（§4.4"组播帧静默丢弃"）：OS 层（node dgram message 事件）不可得 UDP

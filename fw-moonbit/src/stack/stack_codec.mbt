@@ -5,6 +5,9 @@
 // 本实现在 stack 层桥接（rpc/events 保持 Bytes 内部通道）——编解码位置为实现细节，
 // 线上行为一致（编码结果与方向语义相同）
 //
+// v5.0 裸字节编码（§9）：字段按 schema 顺序裸值大端连续编码；
+// 接口级 "crc": true 时在字段序列末尾附加 2B CRC-16/CCITT-FALSE（§9.6，缺省关闭）
+//
 // 顶层 payload 形态：input = 参数类型数组 → Array[FWValue] 逐项对应；
 // output = 单类型 → 解码结果为单元素 Array[FWValue]（应用取 [0]）
 
@@ -22,7 +25,7 @@ fn Stack::iface_of(self : Stack, svc_id : Int, major_ver : Int, if_id : Int) -> 
   }
 }
 
-/// 定位接口定义（版本通配——notify/订阅接收场景；多版本并存属部署异常取任一，v4.4 第三轮定案）
+/// 定位接口定义（版本通配——notify/订阅接收场景；多版本并存属部署异常取任一）
 fn Stack::iface_of_any(self : Stack, svc_id : Int, if_id : Int) -> @idlstore.IdlInterface? {
   match self.store.get_any(svc_id) {
     Some(def) => def.find_interface(if_id)
@@ -35,7 +38,7 @@ fn wrap_input(inputs : Array[@codec.CType]) -> Array[@codec.CField] {
   let out : Array[@codec.CField] = []
   let mut i = 0
   for t in inputs {
-    out.push({ name: "arg\{i}", ctype: t, optional: false })
+    out.push({ name: "arg\{i}", ctype: t })
     i = i + 1
   }
   out
@@ -44,18 +47,52 @@ fn wrap_input(inputs : Array[@codec.CType]) -> Array[@codec.CField] {
 /// output 类型 → 编码 schema（None = 无返回 → 空字段集，编码得空 payload）
 fn wrap_output(out : @codec.CType?) -> Array[@codec.CField] {
   match out {
-    Some(t) => [{ name: "ret", ctype: t, optional: false }]
+    Some(t) => [{ name: "ret", ctype: t }]
     None => []
   }
 }
 
-/// 按 output 方向解码响应/推送 payload（尾部新增字段容忍由 decode_fields 承载，§9.4）
+/// 按接口方向编码：字段序列 + 接口启用 CRC 时附加 2B CRC（§9.6，缺省关闭）
+fn encode_iface(
+  schema : Array[@codec.CField],
+  values : Array[@codec.FWValue],
+  crc : Bool
+) -> Bytes raise @codec.CodecError {
+  let body = @codec.encode_fields(schema, values)
+  if crc {
+    @codec.append_crc16(body)
+  } else {
+    body
+  }
+}
+
+/// 按接口方向解码：接口启用 CRC 时先校验并剥离末尾 2B（§9.6 接收方顺序）
+/// 尾部新增字段容忍由 decode_fields 承载（§9.1/§11.2）
+fn decode_iface(
+  schema : Array[@codec.CField],
+  bytes : Bytes,
+  crc : Bool
+) -> Array[@codec.FWValue] raise @codec.CodecError {
+  let body = if crc {
+    match @codec.verify_and_strip_crc(bytes) {
+      Ok(b) => b
+      // CRC 不匹配 → 契约级解码错误（上层回 RST 0x20，§12.1）
+      Err(_) => raise @codec.CodecError("CRC mismatch: interface declared crc=true")
+    }
+  } else {
+    bytes
+  }
+  @codec.decode_fields(body, schema)
+}
+
+/// 按 output 方向解码响应/推送 payload（CRC 开关随接口，§9.6）
 fn decode_output(
   out : @codec.CType?,
-  bytes : Bytes
+  bytes : Bytes,
+  crc : Bool
 ) -> Result[Array[@codec.FWValue], String] {
   try {
-    Ok(@codec.decode_fields(bytes, wrap_output(out)))
+    Ok(decode_iface(wrap_output(out), bytes, crc))
   } catch {
     e => Err("codec: \{Repr(e)}")
   }
@@ -76,9 +113,9 @@ fn Stack::adapt_handler(
         None => Err(0x24) // 接口不存在（§12.1 Not Found）
         Some(iface) =>
           try {
-            let args = @codec.decode_fields(bytes, wrap_input(iface.input))
+            let args = decode_iface(wrap_input(iface.input), bytes, iface.crc)
             match (h.on_request)(if_id, args) {
-              Ok(vs) => Ok(@codec.encode_fields(wrap_output(iface.output), vs))
+              Ok(vs) => Ok(encode_iface(wrap_output(iface.output), vs, iface.crc))
               Err(code) => Err(code) // 应用侧业务拒绝：RST Code 直通（§13.3）
             }
           } catch {
@@ -95,7 +132,7 @@ fn Stack::adapt_handler(
         None => ()
         Some(iface) =>
           try {
-            let args = @codec.decode_fields(bytes, wrap_input(iface.input))
+            let args = decode_iface(wrap_input(iface.input), bytes, iface.crc)
             ;(h.on_ff)(if_id, args)
           } catch {
             e => st_log_error("[stack] ff codec error: svc=\{svc_id} if=\{if_id} \{Repr(e)}")

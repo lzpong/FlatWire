@@ -3,7 +3,7 @@
 //
 // 两层两码（§12.1）：
 //  - 帧级：max_payload_len 超限（仅 UDP）→ RST(0x23)
-//  - IDL 级：max_payload / max_len / fixed_len / SizeMismatch 等契约违约 → RST(0x20)
+//  - IDL 级：max_payload / max_len / fixed_len / bool 非法 / enum 值域 / CRC 失败等契约违约 → RST(0x20)
 // ============================================================
 
 // ---- RST 错误码总表（§12.1 / §12.2） ----
@@ -35,23 +35,17 @@ export const RST_NAME = Object.freeze({
   0x33: 'Service Unavailable',
 });
 
-// ---- 解码错误（§9.4，IDL 级契约违约统一归 RST(0x20)） ----
+// ---- 解码错误（§9，IDL 级契约违约统一归 RST(0x20)） ----
 export class DecodeError extends Error {
   constructor(msg) { super(msg); this.name = this.constructor.name; }
 }
-// bool 字段头 low4 ∉ {0,1}（§9.1）
+// bool 字节 ∉ {0x00, 0x01}（§9.2 严格解码）
 export class InvalidBoolEncoding extends DecodeError { }
-// signed 字段头 low4=0（恒定宽度下不可达，§9.1）
-export class InvalidSignedLength extends DecodeError { }
-// unsigned 字段头 low4=0（同上）
-export class InvalidUnsignedLength extends DecodeError { }
-// signed/unsigned 线上宽度 ≠ IDL size（§9.2 恒定宽度校验位）
-export class SizeMismatch extends DecodeError { }
-// 非 optional 字段编码为 null（§9.1/§9.2）
+// 结构体字段缺失或值为 null（v5 全字段必填、无 null 编码，§9.1）
 export class UnexpectedNull extends DecodeError { }
-// 字段类型 0x9~0xF（未定义类型，§9.4；新增类型 = Major 不兼容变更）
+// 未知字段类型名 / 未知整型宽度（§9.2 类型白名单之外）
 export class UnknownFieldType extends DecodeError { }
-// float 子类型非法或 80bit 扩展不支持（§9.1）
+// f80 扩展不支持（§9.2 可选扩展，本实现加载期/编解码期拒绝）
 export class UnsupportedFloatType extends DecodeError { }
 // 编码缓冲不足（数据被截断）
 export class BufferUnderrun extends DecodeError { }

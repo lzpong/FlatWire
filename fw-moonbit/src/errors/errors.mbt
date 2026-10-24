@@ -1,6 +1,6 @@
 /// §12 错误处理与恢复 —— 错误码总表（§12.1）与应用层错误类型
 ///
-/// 两层两码原则（v4.2 定案）：
+/// 两层两码原则：
 /// - 帧级超限（max_payload_len，仅 UDP）→ 0x23
 /// - IDL 级契约违约（max_payload/max_len/fixed_len/SizeMismatch/UnexpectedNull）→ 0x20
 /// - 服务不存在 → 0x24；处理异常 → 0x30

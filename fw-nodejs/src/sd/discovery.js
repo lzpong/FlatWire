@@ -731,7 +731,7 @@ export class Discovery extends EventEmitter {
       // 发现缓存无在线实例 → 不发起查询，当前操作直接失败（§7.2）
       throw new ServiceNotFound(`GetIDL aborted: svc=${svcId} has no online instance in discovery cache`);
     }
-    // §7.2（v4.4 定案）：查询失败（超时/RST/连接断开）一律上抛当前操作（调用/订阅/注册），
+    // §7.2：查询失败（超时/RST/连接断开）一律上抛当前操作（调用/订阅/注册），
     // 由应用决定重试——协议栈不自动重发（与 MoonBit 版 getidl.mbt 行为一致）
     return await this._doGetIdl(target, svcId, majorVer);
   }
@@ -760,7 +760,7 @@ export class Discovery extends EventEmitter {
         if (this.pendingIdl.get(idx) === waiter) {
           this.pendingIdl.delete(idx);
           this.strm.releaseControlStrm(peer, strm);
-          // 超时：释放/冷却，查询失败上抛当前操作（§7.2 v4.4 定案：由应用决定重试）
+          // 超时：释放/冷却，查询失败上抛当前操作（§7.2：由应用决定重试）
           reject(new GetIdlError(`GetIDL timeout (svc=${svcId})`));
         }
       }, this.cfg.response_timeout_ms);

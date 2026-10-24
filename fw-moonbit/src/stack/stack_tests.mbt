@@ -19,6 +19,7 @@ fn make_stack() -> Stack {
         tcp: false,
         max_payload: 0,
         reliable: false,
+        crc: false,
         input: [],
         output: None,
       },
@@ -116,11 +117,11 @@ test "offer discover then call delivers response" {
 /// Response → output 解码交付（§13 payload 语义全链路；CStruct ↔ VArray，§9.3）
 test "call with struct codec roundtrip" {
   let s = Stack::new(StackConfig::default("unused_dir"))
-  // 简化 VehicleState：unsigned(1) + timestamp + float64 三字段 struct（§11.1 字段形态）
+  // 简化 VehicleState：u8 + timestamp + f64 三字段 struct（§11.1 v5.0 字段形态）
   let vs_t : @codec.CType = @codec.CStruct([
-    { name: "veh_md", ctype: @codec.CUnsigned(1), optional: false },
-    { name: "timestamp", ctype: @codec.CTimestamp, optional: false },
-    { name: "ratio", ctype: @codec.CFloat(64), optional: false },
+    { name: "veh_md", ctype: @codec.CUInt(1) },
+    { name: "timestamp", ctype: @codec.CTimestamp },
+    { name: "ratio", ctype: @codec.CFloat(64) },
   ])
   let def : @idlstore.IdlDef = {
     name: "t",
@@ -135,6 +136,7 @@ test "call with struct codec roundtrip" {
         tcp: false,
         max_payload: 0,
         reliable: false,
+        crc: false,
         input: [],
         output: Some(vs_t),
       },
@@ -162,15 +164,15 @@ test "call with struct codec roundtrip" {
   let mut reg_done = 0
   s.register_service(1, 1, {
     on_request: fn(_i, _args) {
-      Ok([@codec.VArray([@codec.VUnsigned(3), @codec.VTimestamp(123456L), @codec.VFloat(0.5)])])
+      Ok([@codec.VArray([@codec.VUInt(3), @codec.VTimestamp(123456L), @codec.VFloat(0.5)])])
     },
     on_ff: fn(_i, _args) { () },
   }, fn() { reg_done = reg_done + 1 }, fn(_e) { () })
   assert_eq(reg_done, 1)
   // call → 手动投递同 schema 编码的 Response（transport 未启动，服务端响应不回环）
   let expect_body = @codec.encode_fields(
-    [{ name: "ret", ctype: vs_t, optional: false }],
-    [@codec.VArray([@codec.VUnsigned(3), @codec.VTimestamp(123456L), @codec.VFloat(0.5)])],
+    [{ name: "ret", ctype: vs_t }],
+    [@codec.VArray([@codec.VUInt(3), @codec.VTimestamp(123456L), @codec.VFloat(0.5)])],
   )
   let mut got : Array[@codec.FWValue] = []
   let mut errs = 0
@@ -183,7 +185,7 @@ test "call with struct codec roundtrip" {
   match got[0] {
     @codec.VArray(fs) => {
       assert_eq(fs.length(), 3)
-      assert_eq(fs[0], @codec.VUnsigned(3))
+      assert_eq(fs[0], @codec.VUInt(3))
       assert_eq(fs[1], @codec.VTimestamp(123456L))
       assert_eq(fs[2], @codec.VFloat(0.5)) // 0.5 IEEE754 无损
     }
@@ -245,4 +247,71 @@ test "register service flow" {
   }, fn() { () }, fn(_e) { err = true })
   assert_eq(err, true)
   s.unregister_service(1, 1)
+}
+
+/// 测试 1.34/1.35：接口 crc=true 时响应末尾附加 2B CRC；篡改 → 解码失败（应用侧 on_err）
+test "crc interface encode & decode" {
+  let s = Stack::new(StackConfig::default("unused_dir"))
+  let out_t : @codec.CType = @codec.CUInt(2)
+  let def : @idlstore.IdlDef = {
+    name: "t",
+    svc_id: 1,
+    major_ver: 1,
+    minor_ver: 0,
+    interfaces: [
+      {
+        name: "R",
+        if_id: 5,
+        kind: @idlstore.IfRpc,
+        tcp: false,
+        max_payload: 0,
+        reliable: false,
+        crc: true, // §9.6 接口级 CRC 开启
+        input: [],
+        output: Some(out_t),
+      },
+    ],
+    groups: [],
+    raw: "{}",
+  }
+  let _ = s.store.put(def)
+  // 对端 Offer → 发现缓存（§7.2 handle_offer）
+  let offer : @frame.Frame = {
+    ctr: true,
+    ren: false,
+    ver: 0,
+    msk: false,
+    typ: @frame.Non,
+    code: 0x01,
+    svc_id: 0,
+    if_id: 0,
+    inst_id: 0,
+    strm_id: 0,
+    payload: @sd.encode_offer_entries([{ svc_id: 1, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 4 }]),
+  }
+  s.on_transport_event(@transport.UdpFrame(offer, "10.0.0.9", 5400, true))
+  // 正常响应：字段 0x1234 + 2B CRC（大端附加，§9.6）
+  let body = @codec.encode_fields([{ name: "ret", ctype: out_t }], [@codec.VUInt(0x1234L)])
+  let with_crc = @codec.append_crc16(body)
+  assert_eq(with_crc.length(), 4)
+  let mut got : Array[@codec.FWValue] = []
+  let mut errs = 0
+  s.call(1, 1, 5, [], 0, fn(vs) { got = vs }, fn(_e) { errs = errs + 1 })
+  s.on_transport_event(@transport.UdpFrame(data_frame(@frame.Non, 0x10, 1, 5, 1, 1, with_crc), "10.0.0.9", 5400, false))
+  assert_eq(errs, 0)
+  assert_eq(got[0], @codec.VUInt(0x1234L))
+  // 篡改字段字节 → CRC 校验失败 → 应用侧 on_err（对应 RST 0x20 的上层映射）
+  let tampered = @buffer.Buffer(size_hint=with_crc.length())
+  for i in 0..<with_crc.length() {
+    let b = if i == 1 {
+      (with_crc[i].to_int() ^ 0x01).to_byte()
+    } else {
+      with_crc[i]
+    }
+    tampered.write_byte(b)
+  }
+  let mut errs2 = 0
+  s.call(1, 1, 5, [], 0, fn(_vs) { () }, fn(_e) { errs2 = errs2 + 1 })
+  s.on_transport_event(@transport.UdpFrame(data_frame(@frame.Non, 0x10, 1, 5, 1, 2, tampered.to_bytes()), "10.0.0.9", 5400, false))
+  assert_eq(errs2, 1)
 }

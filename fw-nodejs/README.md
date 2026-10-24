@@ -1,6 +1,6 @@
-# fw-nodejs —— FlatWire Protocol (FW) v4.4 协议栈（JavaScript/Node.js 实现）
+# fw-nodejs —— FlatWire Protocol (FW) v5.0 协议栈（JavaScript/Node.js 实现）
 
-FlatWire Protocol v4.4 车辆软件 RPC/事件推送协议栈的 Node.js 参考实现。
+FlatWire Protocol v5.0 车辆软件 RPC/事件推送协议栈的 Node.js 参考实现（**裸字节编码**：无字段头/类型标记，字段按 IDL 顺序裸值大端连续编码）。
 
 - **零第三方依赖**：仅使用 `node:` 内置模块（dgram / net / fs / crypto / events）
 - **纯动态架构**（§11.1）：协议栈不内置任何 IDL、无代码生成、无 Stub——服务定义全部运行时从 IDL 库（本地文件夹）加载，编解码由协议栈按已加载 IDL 动态执行
@@ -9,7 +9,7 @@ FlatWire Protocol v4.4 车辆软件 RPC/事件推送协议栈的 Node.js 参考�
 ## 运行
 
 ```powershell
-# 单元测试（66 项：codec / frame / transport / sd-rpc）
+# 单元测试（71 项：codec / frame / transport / sd-rpc）
 npm test
 
 # 示例（两个终端分别运行；NodeB 空 IDL 库起步，自动 GetIDL 落盘后调用成功）
@@ -30,7 +30,7 @@ fw-nodejs/
 │   ├── strm.js             StrmID 管理：数据帧池 + 控制帧统一池（§6，释放含冷却）
 │   ├── codec/
 │   │   ├── crc.js          CRC-16/CCITT-FALSE（§9.6，自检值 0x29B1）
-│   │   ├── types.js        §9 全类型编解码（恒定宽度/optional/null/CRC/MSK-XOR）
+│   │   ├── types.js        §9 裸字节编解码（类型独立化/长度前缀/嵌套/CRC/MSK-XOR）
 │   │   └── schema.js       IDL 解析 + 接口级 payload 编解码（§11.1/§13）
 │   ├── frame/
 │   │   └── frame.js        8B 帧头编解码 + §4.3 十步解析 + §4.1 TCP 流式解析（半帧两阶段）
@@ -48,7 +48,7 @@ fw-nodejs/
 │   └── events/
 │       └── events.js       §8 事件推送（接口缓存/全量推送/CON 推送重传/tcp-event）
 ├── examples/               示例（规范 §11.1 VehicleState IDL，实现计划 §5 场景）
-└── test/                   node:test 单元测试（对齐《Test Cases.v4.md》编号）
+└── test/                   node:test 单元测试（对齐《Test Cases.v5.md》编号）
 ```
 
 ## 规范章节 ↔ 模块映射
@@ -70,7 +70,7 @@ fw-nodejs/
 | §7.1~7.2 SD | 四操作 Entry、Offer 拆帧、Find 响应、GetIDL（仅 TCP、落盘持久化、双角色统一触发、启动 Find 预热） | `sd/entries.js` + `sd/discovery.js` + `idlstore/store.js` |
 | §7.4~7.5 状态机/TTL | Unknown→Found→Subscribed→Expired；订阅/发现 TTL tick；自动重订阅 | `sd/discovery.js` |
 | §8 订阅管理 | Subscribe(CON/NON)、ACK(0x10)/ACK(0x00)、全量推送、tcp-event 预建连接、逐 Entry 处理 | `sd/discovery.js` + `events/events.js` |
-| §9 编解码 | 恒定宽度、CRC-16/CCITT-FALSE、optional/null、fixed_len 填 0、末尾新增字段容忍 | `codec/types.js` |
+| §9 编解码 | 裸字节编码（无字段头/类型标记）、类型独立化、fixed_len 无前缀 / max_len 前缀宽度 w(N)、CRC-16/CCITT-FALSE 缺省关闭、末尾新增字段容忍 | `codec/types.js` + `codec/schema.js` |
 | §10 Masking | MSK=1 XOR（先 CRC 后 XOR）、控制帧禁 MSK | `codec/types.js` + `frame/frame.js` |
 | §11.1 IDL | 纯动态加载、type_def 顶层、transport 绑定、事件组 | `codec/schema.js` + `idlstore/store.js` |
 | §12 错误码 | 两层两码：帧级 0x23（仅 UDP）/IDL 级 0x20；RST 码表 | `errors.js` + 各模块 |
@@ -111,11 +111,11 @@ fw-nodejs/
 
 ## 测试
 
-`npm test` 运行 66 项单元测试（`node:test`，对齐《Test Cases.v4.md》用例编号）：
+`npm test` 运行 71 项单元测试（`node:test`，对齐《Test Cases.v5.md》用例编号）：
 
-- **codec（26）**：CRC 自检值 0x29B1、§9 全类型往返/边界/非法编码、MSK-XOR
+- **codec（31）**：CRC 自检值 0x29B1、§1 裸字节编解码（1.5~1.38：强制长度声明/bool 严格/恒定宽度/值域/float/timestamp/前缀宽度/定长与变长/嵌套/enum/CRC 缺省与开启/末尾字段忽略/大端）、MSK-XOR
 - **frame（22）**：§4.3 解析矩阵（非法组合 → 正确 RST Code）、RST 回显形态
 - **transport（8）**：TCP 粘包/分包/跨包、半帧两阶段全场景（精确丢弃/恢复/EOF/反向 RST 不污染正向流）
 - **sd-rpc（10）**：重传时间线 200/600/1400ms、响应缓存去重、双栈真实回环集成（发现/GetIDL 拉取落盘/调用往返/订阅确认链路/事件推送/全量推送/取消确认/REN 清缓存）
 
-集成冒烟（`examples/` 双进程真实回环）已验证：发现 → 空 IDL 库自动 GetIDL 落盘 → rpc 往返（含 optional/定长字段）→ fire_forget → 订阅确认 ACK(0x10) → 全量推送/实时推送 → 服务端优雅退出（REN×3）→ 客户端感知缓存清空 → 服务端重启后重新发现。
+集成冒烟（`examples/` 双进程真实回环）已验证：发现 → 空 IDL 库自动 GetIDL 落盘 → rpc 往返（含 fixed_len=20 定长串与 max_len 变长串）→ fire_forget → 订阅确认 ACK(0x10) → 全量推送/实时推送 → 服务端优雅退出（REN×3）→ 客户端感知缓存清空 → 服务端重启后重新发现。

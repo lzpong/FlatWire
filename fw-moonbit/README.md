@@ -1,6 +1,8 @@
-# FlatWire Protocol v4.4 — MoonBit 实现
+# FlatWire Protocol v5.0 — MoonBit 实现
 
-FlatWire Protocol v4.4 协议栈的 MoonBit 实现，编译目标为 JavaScript（Node.js 运行时）。
+FlatWire Protocol v5.0 协议栈的 MoonBit 实现，编译目标为 JavaScript（Node.js 运行时）。
+线格式为**裸字节编码**（§9）：字段按 IDL schema 顺序裸值大端连续编码，无字段头/类型标记/
+optional；类型白名单 u8~u64 / i8~i64 / f32 / f64 / bool / timestamp / enum(base)。
 纯动态架构：协议栈不内置任何 IDL，服务定义运行时从 IDL 库（本地文件夹）加载，
 客户端缺失定义时经 GetIDL 从集群自动拉取并持久化落盘（§7.2）。
 
@@ -12,7 +14,7 @@ $env:Path = "C:\Users\Ong\.moon\bin;$env:Path"   # moon 不在默认 PATH 时
 
 cd implementations\fw-moonbit
 
-# 运行全部单元测试（100 用例；必须显式指定 js 目标——extern "js" 不支持默认 wasm 后端）
+# 运行全部单元测试（117 用例；必须显式指定 js 目标——extern "js" 不支持默认 wasm 后端）
 moon test --target js
 
 # 构建示例（产物位于 _build\js\debug\build\examples\...）
@@ -21,7 +23,8 @@ moon build --target js
 # 启动服务端节点（预置 IDL：examples/node_a/idl/4096_v1.json）
 node "_build\js\debug\build\examples\node_a\node_a.js" --run-for 45000
 
-# 启动客户端节点（另一终端；IDL 库留空，验证 GetIDL 自动拉取落盘）
+# 启动客户端节点（另一终端；删除 examples\node_b\idl\4096_v1.json 置空库，
+# 验证 GetIDL 自动拉取落盘；NodeA 先退出以便 B 观察 REN）
 $env:FW_BIND = "127.0.0.2"
 node "_build\js\debug\build\examples\node_b\node_b.js" --run-for 55000
 ```
@@ -43,8 +46,9 @@ NodeA=127.0.0.1 / NodeB=127.0.0.2，同机演示按回环 IP 区分单播投递�
 
 ```
 src/
-  codec/     编码层（§9）：CRC-16/CCITT-FALSE（§9.1）、掩码（§9.2）、
-             全类型 V* 编解码（恒定宽度规则、null 仅限 optional、定长空位填 0）
+  codec/     编码层（§9）：裸字节编解码（u8~u64 / i8~i64 / f32 / f64 / bool /
+             timestamp / enum base；fixed_len 无前缀、max_len 前缀宽度 w(N)）、
+             CRC-16/CCITT-FALSE（§9.6，接口 "crc": true 开启）、掩码（§10）
   frame/     帧层（§3/§4）：帧头（§3）、UDP 十步解析（§4.3）、
              TCP 半帧两阶段超时（§4.1 帧头不完整关连接 / Payload 不完整精确丢弃）
   errors/    错误码表（§11）：两层两码——帧级 0x23 / IDL 契约级 0x20（§8.1）
@@ -109,7 +113,7 @@ MoonBit 与 Node.js 的边界位于各模块 `*_ffi.mbt`，通过 `extern "js"` 
 2. **IDL 编解码位于 stack 层**（`stack/stack_codec.mbt`）：rpc/events 层只收发
    `Bytes`；FWValue ↔ 线缆格式的编解码与 transport 绑定路由集中在 stack 层完成。
 3. **应用侧值为按序数组**：示例应用以 `@codec.V*` 值的数组按 IDL 字段序构造
-   请求/事件负载（FWValue 无按名寻址）。
+   请求/事件负载（FWValue 无按名寻址）；v5.0 全部字段必填，无 null/optional 值。
 4. **tick 粒度 500ms**：半帧超时（§4.1）与心跳（§5.7）检查以 500ms 周期轮询驱动，
    超时判定按协议常量（tcp_frame_timeout_ms / 2×heartbeat_period_ms），粒度仅影响
    检查时刻精度，不影响判定阈值。

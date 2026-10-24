@@ -207,7 +207,7 @@ fn Sd::handle_sub_ack(self : Sd, f : @frame.Frame, host : String) -> Unit {
           // 重复 0x10（服务端对重传 CON 的重复确认）：幂等忽略
         None => ()
       }
-    // 非活跃会话的迟到确认（StrmID 已冷却）：静默丢弃（v4.4 定案）
+    // 非活跃会话的迟到确认（StrmID 已冷却）：静默丢弃
     None => ()
   }
 }

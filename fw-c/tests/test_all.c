@@ -22,7 +22,7 @@ int suite_regress(void);
 int main(int argc, char **argv) {
   int fails = 0;
   int only = argc > 1 ? atoi(argv[1]) : 0; // 可选：单跑某套件（1~12）
-  printf("== FlatWire Protocol v4.4 C 实现 —— 单元测试 ==\n"); fflush(stdout);
+  printf("== FlatWire Protocol v5.0 C 实现 —— 单元测试 ==\n"); fflush(stdout);
   if (only == 0 || only == 1) fails += suite_crc();
   if (only == 0 || only == 2) fails += suite_value_json();
   if (only == 0 || only == 3) fails += suite_codec();

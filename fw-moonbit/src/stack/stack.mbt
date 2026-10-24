@@ -76,7 +76,7 @@ pub fn Stack::new(cfg : StackConfig) -> Stack {
     tcp_port: cfg.tcp_port,
     bind_address: cfg.bind_address,
     tcp_enabled: cfg.tcp_enabled,
-    local_ver: 0, // 本端协议版本：v4.4 固化设计无演进空间（§1.3），恒 0
+    local_ver: 0, // 本端协议版本：固化设计无演进空间（§1.3），恒 0
     max_payload_len: cfg.max_payload_len,
     tcp_frame_timeout_ms: cfg.tcp_frame_timeout_ms,
     heartbeat_period_ms: cfg.heartbeat_period_ms,

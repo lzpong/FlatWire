@@ -1,4 +1,5 @@
 {
+  "version": "1.0",
   "service": {
     "name": "VehicleStateService",
     "svc_id": 4096,
@@ -18,14 +19,13 @@
   "type_def": {
     "structs": {
       "VehicleState": [
-        { "name": "veh_md",     "type": "unsigned", "size": 1 },
-        { "name": "usg_md",     "type": "unsigned", "size": 1 },
-        { "name": "sys_pwr_md", "type": "signed",   "size": 1 },
+        { "name": "veh_md",     "type": "u8" },
+        { "name": "usg_md",     "type": "u8" },
+        { "name": "sys_pwr_md", "type": "i8" },
         { "name": "timestamp",  "type": "timestamp" },
-        { "name": "timestr",    "type": "string",   "fixed_len": 20 },
-        { "name": "status_msg", "type": "string",   "max_len": 64 },
-        { "name": "diag_note",  "type": "string",   "max_len": 32, "optional": true },
-        { "name": "ratio",      "type": "float",    "width": 64 }
+        { "name": "timestr",    "type": "string", "fixed_len": 20 },
+        { "name": "status_msg", "type": "string", "max_len": 64 },
+        { "name": "ratio",      "type": "f64" }
       ],
       "Blob": [
         { "name": "vin",     "type": "bytes", "fixed_len": 17 },
@@ -34,13 +34,13 @@
     },
     "enums": {
       "PowerMode": {
-        "type": "unsigned", "size": 1,
+        "base": "u8",
         "values": { "Off": 0, "Accessory": 1, "Run": 2, "CrankRequest": 3 }
       }
     },
     "arrays": {
-      "VehicleStateArray":  { "type": "array", "fixed_len": 10, "element_type": "VehicleState" },
-      "VehicleStateArray2": { "type": "array", "max_len": 100,  "element_type": "VehicleState" }
+      "VehicleStateArray":  { "fixed_len": 10, "element_type": "VehicleState" },
+      "VehicleStateArray2": { "max_len": 100,  "element_type": "VehicleState" }
     }
   }
 }

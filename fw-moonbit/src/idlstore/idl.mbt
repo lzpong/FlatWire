@@ -1,6 +1,6 @@
 // §11.1 IDL JSON → 运行时定义解析
 //
-// 纯动态架构（v4.4 定案）：协议栈不内置任何 IDL、无代码生成/无 Stub——
+// 纯动态架构：协议栈不内置任何 IDL、无代码生成/无 Stub——
 // 全部服务定义运行时从 IDL 库 JSON 文本解析；接口 transport 绑定声明内嵌于 IDL，
 // 协议栈运行时解析用于路由；自定义类型引用在解析时递归内联展开为 codec CType 树。
 //
@@ -33,6 +33,7 @@ pub(all) struct IdlInterface {
   tcp : Bool // transport 绑定（省略时 rpc/ff=tcp、event=udp，§11.1）
   max_payload : Int // 接口级 Payload 上限（0=未声明；TCP/UDP 均适用，§11.1）
   reliable : Bool // event 推送可靠性：UDP 上 true=CON 重传；TCP 恒 NON（§11.1）
+  crc : Bool // 接口级 CRC 开关（§9.6）：true 时 payload 末尾附加 2B CRC，缺省关闭
   input : Array[@codec.CType] // 参数类型（内联展开；"input": [] → 空数组）
   output : @codec.CType? // 返回值类型（缺省 None）
 } derive(Eq)
@@ -164,6 +165,11 @@ fn parse_interface(j : Json, ctx : TypeCtx) -> IdlInterface raise IdlError {
     Some(True) => true
     _ => false
   }
+  // §9.6：接口级 CRC 缺省关闭，声明 "crc": true 才在字段序列末尾附加 2B CRC
+  let crc = match obj_get(j, "crc") {
+    Some(True) => true
+    _ => false
+  }
   // input: [] 或 ["TypeName"]——引用名数组，逐个展开
   let input : Array[@codec.CType] = []
   match obj_get(j, "input") {
@@ -182,7 +188,7 @@ fn parse_interface(j : Json, ctx : TypeCtx) -> IdlInterface raise IdlError {
     Some(String(tname)) => Some(resolve_type(tname, ctx, 0))
     _ => None
   }
-  IdlInterface::{ name, if_id, kind, tcp, max_payload, reliable, input, output }
+  IdlInterface::{ name, if_id, kind, tcp, max_payload, reliable, crc, input, output }
 }
 
 /// 解析事件组项
@@ -207,41 +213,168 @@ fn parse_group(j : Json) -> IdlGroup raise IdlError {
   IdlGroup::{ name, grp_id, members }
 }
 
-/// 类型名解析（structs/enums/arrays 引用 + 基础类型内联；depth 防循环引用）
-fn resolve_type(tname : String, ctx : TypeCtx, depth : Int) -> @codec.CType raise IdlError {
-  guard depth <= 32 else { raise IdlError("type nesting too deep (cyclic reference?): \{tname}") }
-  // 基础类型（§9.1 类型系统）
+/// 标量类型白名单（§11.1）：u8/u16/u32/u64、i8/i16/i32/i64、f32/f64、bool、timestamp
+fn scalar_ctype(tname : String) -> @codec.CType? {
   match tname {
-    "bool" => return @codec.CBool
-    "timestamp" => return @codec.CTimestamp
-    _ => ()
+    "u8" => Some(@codec.CUInt(1))
+    "u16" => Some(@codec.CUInt(2))
+    "u32" => Some(@codec.CUInt(4))
+    "u64" => Some(@codec.CUInt(8))
+    "i8" => Some(@codec.CInt(1))
+    "i16" => Some(@codec.CInt(2))
+    "i32" => Some(@codec.CInt(4))
+    "i64" => Some(@codec.CInt(8))
+    "f32" => Some(@codec.CFloat(32))
+    "f64" => Some(@codec.CFloat(64))
+    "bool" => Some(@codec.CBool)
+    "timestamp" => Some(@codec.CTimestamp)
+    _ => None
   }
-  // enums：线格式 = 底层整型（§11.1），解析为恒定宽度整型
-  match ctx.enums.get(tname) {
-    Some(j) =>
-      return match obj_get(j, "type") {
-        Some(String("signed")) => @codec.CSigned(num_field(j, "size"))
-        Some(String("unsigned")) => @codec.CUnsigned(num_field(j, "size"))
-        _ => raise IdlError("enum \{tname}: invalid base type")
+}
+
+/// 长度声明合法性（§9.3）：fixed_len 与 max_len 必须恰声明其一且非负
+fn check_len_decl(fixed_len : Int?, max_len : Int?, what : String) -> Unit raise IdlError {
+  match (fixed_len, max_len) {
+    (Some(n), None) =>
+      if n < 0 {
+        raise IdlError("\{what}: fixed_len must be non-negative")
       }
+    (None, Some(n)) =>
+      if n < 0 {
+        raise IdlError("\{what}: max_len must be non-negative")
+      }
+    (None, None) =>
+      // §9.3 强制约束：无上界则长度前缀宽度无法静态确定 → IDL 加载失败
+      raise IdlError("\{what}: must declare fixed_len or max_len")
+    (Some(_), Some(_)) =>
+      raise IdlError("\{what}: fixed_len and max_len are mutually exclusive")
+  }
+}
+
+/// v5.0 类型独立化：拒绝已取消的 size/width 属性（§11.1）
+fn reject_legacy_attrs(j : Json, what : String) -> Unit raise IdlError {
+  match obj_get(j, "size") {
+    Some(_) => raise IdlError("\{what}: \"size\" is not allowed in v5.0 (use u8/u16/u32/u64/i8/...)")
     None => ()
   }
-  // arrays：{ type:"array", fixed_len/max_len, element_type }
+  match obj_get(j, "width") {
+    Some(_) => raise IdlError("\{what}: \"width\" is not allowed in v5.0 (use f32/f64)")
+    None => ()
+  }
+}
+
+/// enum base → 底层整型 CType（§9.2/§11.1：默认 u8，可 i8 等支持负值）
+fn enum_base_ctype(base : String, tname : String) -> @codec.CType raise IdlError {
+  match base {
+    "u8" => @codec.CUInt(1)
+    "u16" => @codec.CUInt(2)
+    "u32" => @codec.CUInt(4)
+    "u64" => @codec.CUInt(8)
+    "i8" => @codec.CInt(1)
+    "i16" => @codec.CInt(2)
+    "i32" => @codec.CInt(4)
+    "i64" => @codec.CInt(8)
+    _ => raise IdlError("enum \{tname}: unsupported base \{base}")
+  }
+}
+
+/// enum values 校验（§11.1）：值必须在 base 值域内且互不重复
+fn check_enum_values(j : Json, base : @codec.CType, tname : String) -> Unit raise IdlError {
+  let (signed, width) = match base {
+    @codec.CUInt(n) => (false, n)
+    @codec.CInt(n) => (true, n)
+    _ => raise IdlError("enum \{tname}: invalid base type")
+  }
+  match obj_get(j, "values") {
+    Some(Object(m)) => {
+      let seen : Array[Int] = []
+      for _k, v in m {
+        let n = match v {
+          Number(d, ..) => d.to_int()
+          _ => raise IdlError("enum \{tname}: value must be a number")
+        }
+        // 值域校验（§9.2；u64/i64 全值域仅校验符号侧）
+        let bits = width * 8
+        let in_range = if signed {
+          if bits == 64 {
+            true
+          } else {
+            n >= -(1 << (bits - 1)) && n <= (1 << (bits - 1)) - 1
+          }
+        } else if bits == 64 {
+          n >= 0
+        } else {
+          n >= 0 && n <= (1 << bits) - 1
+        }
+        guard in_range else {
+          raise IdlError("enum \{tname}: value \{n} out of base range")
+        }
+        // 重复值检测（§11.1 values 互不重复）
+        let mut dup = false
+        for s in seen {
+          if s == n {
+            dup = true
+          }
+        }
+        guard !dup else {
+          raise IdlError("enum \{tname}: duplicate value \{n}")
+        }
+        seen.push(n)
+      }
+    }
+    Some(_) => raise IdlError("enum \{tname}: values must be an object")
+    None => ()
+  }
+}
+
+/// 类型名解析（structs/enums/arrays 引用 + 标量白名单；depth 防循环引用）
+fn resolve_type(tname : String, ctx : TypeCtx, depth : Int) -> @codec.CType raise IdlError {
+  guard depth <= 32 else { raise IdlError("type nesting too deep (cyclic reference?): \{tname}") }
+  // §11.1 标量类型白名单（v5.0 类型独立化，无 size/width）
+  match scalar_ctype(tname) {
+    Some(t) => return t
+    None => ()
+  }
+  // f80 为可选扩展：本实现不支持 → IDL 加载失败（§9.2/测试 1.12）
+  match tname {
+    "f80" => raise IdlError("f80: unsupported on this implementation")
+    // 非白名单类型名（§11.1）
+    "unsigned" | "signed" | "float" =>
+      raise IdlError("\{tname}: type is not allowed (use u8/u16/u32/u64/i8/i16/i32/i64/f32/f64)")
+    // string/bytes/array 必须由字段/数组定义携带长度声明，不能作为裸引用
+    "string" | "bytes" | "array" =>
+      raise IdlError("\{tname}: must declare fixed_len or max_len at field/array definition")
+    _ => ()
+  }
+  // enums：线格式 = base 声明的整型裸值（§9.2），未知值透传
+  match ctx.enums.get(tname) {
+    Some(j) => {
+      reject_legacy_attrs(j, "enum \{tname}")
+      // v5.0：enum 基类型改由 base 声明（默认 u8），旧 "type"/"size" 格式不再允许
+      match obj_get(j, "type") {
+        Some(_) => raise IdlError("enum \{tname}: use \"base\" instead of \"type\" in v5.0")
+        None => ()
+      }
+      let base = match obj_get(j, "base") {
+        Some(String(s)) => s
+        _ => "u8"
+      }
+      let ct = enum_base_ctype(base, tname)
+      check_enum_values(j, ct, tname)
+      return ct
+    }
+    None => ()
+  }
+  // arrays：{ fixed_len / max_len, element_type }（v5.0 不再写 "type":"array"）
   match ctx.arrays.get(tname) {
     Some(j) => {
-      // 模式位置匹配 Json.String 变体（表达式位置 String 构造不可用）；guard 条件中的 match 需括号包裹
-      guard (match obj_get(j, "type") {
-        Some(String("array")) => true
-        _ => false
-      }) else {
-        raise IdlError("array \{tname}: type must be \"array\"")
-      }
+      let fixed = opt_num(j, "fixed_len")
+      let maxl = opt_num(j, "max_len")
+      check_len_decl(fixed, maxl, "array \{tname}")
       let elem = match obj_get(j, "element_type") {
         Some(String(en)) => resolve_type(en, ctx, depth + 1)
         _ => raise IdlError("array \{tname}: missing element_type")
       }
-      let fixed = opt_num(j, "fixed_len")
-      let maxl = opt_num(j, "max_len")
       return @codec.CArray(elem, fixed, maxl)
     }
     None => ()
@@ -265,39 +398,51 @@ fn resolve_type(tname : String, ctx : TypeCtx, depth : Int) -> @codec.CType rais
   raise IdlError("unknown type: \{tname}")
 }
 
-/// 解析 struct 字段对象 → CField（type 为基础类型名或自定义类型引用）
+/// 解析 struct 字段对象 → CField（type 为标量白名单类型名或自定义类型引用）
 fn parse_field(j : Json, ctx : TypeCtx, depth : Int) -> @codec.CField raise IdlError {
   let name = match obj_get(j, "name") {
     Some(String(s)) => s
     _ => raise IdlError("field missing name")
   }
+  // §11.1 v5.0：全部字段必填，IDL 中出现 optional → schema 错误
+  match obj_get(j, "optional") {
+    Some(_) => raise IdlError("\{name}: optional is not supported in v5.0")
+    None => ()
+  }
+  reject_legacy_attrs(j, name)
   let tname = match obj_get(j, "type") {
     Some(String(s)) => s
     _ => raise IdlError("\{name}: missing type")
   }
-  let optional = match obj_get(j, "optional") {
-    Some(True) => true
-    _ => false
-  }
   let ctype = match tname {
-    // §9.1 基础类型内联（size/fixed_len/max_len/width 由字段携带）
-    "bool" => @codec.CBool
-    "signed" => @codec.CSigned(num_field(j, "size"))
-    "unsigned" => @codec.CUnsigned(num_field(j, "size"))
-    "float" =>
-      @codec.CFloat(
-        match opt_num(j, "width") {
-          Some(w) => w
-          None => 64
-        },
-      )
-    "timestamp" => @codec.CTimestamp
-    "string" => @codec.CString(opt_num(j, "fixed_len"), opt_num(j, "max_len"))
-    "bytes" => @codec.CBytes(opt_num(j, "fixed_len"), opt_num(j, "max_len"))
-    // 自定义类型引用（struct/enum/array 递归展开；§9.3 任意嵌套）
+    // §9.3 string/bytes：必须声明 fixed_len 或 max_len
+    "string" => {
+      let fixed = opt_num(j, "fixed_len")
+      let maxl = opt_num(j, "max_len")
+      check_len_decl(fixed, maxl, name)
+      @codec.CString(fixed, maxl)
+    }
+    "bytes" => {
+      let fixed = opt_num(j, "fixed_len")
+      let maxl = opt_num(j, "max_len")
+      check_len_decl(fixed, maxl, name)
+      @codec.CBytes(fixed, maxl)
+    }
+    // §9.4 内联数组字段：{ "type":"array", fixed_len/max_len, element_type }
+    "array" => {
+      let fixed = opt_num(j, "fixed_len")
+      let maxl = opt_num(j, "max_len")
+      check_len_decl(fixed, maxl, name)
+      let elem = match obj_get(j, "element_type") {
+        Some(String(en)) => resolve_type(en, ctx, depth + 1)
+        _ => raise IdlError("\{name}: missing element_type")
+      }
+      @codec.CArray(elem, fixed, maxl)
+    }
+    // 标量白名单 + 自定义类型引用（struct/enum/array 递归展开；§9.4 任意嵌套）
     _ => resolve_type(tname, ctx, depth)
   }
-  @codec.CField::{ name, ctype, optional }
+  @codec.CField::{ name, ctype }
 }
 
 /// JSON 对象取键（非对象 → None）

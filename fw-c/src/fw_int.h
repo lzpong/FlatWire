@@ -23,7 +23,7 @@ typedef struct {
 // ---------- 等待者（手工状态机挂接点） ----------
 struct fw_tcpconn;   // 前置声明（定义见下，避免原型内局部 tag 作用域问题）
 struct fw_call_ctx;  // 前置声明（定义见下）
-enum { FW_W_NONE = 0, FW_W_CALL = 1 }; // [REVIEW P3-5] 移除死代码 FW_W_REG；[REVIEW P2-3] 移除无动作的 FW_W_FIND
+enum { FW_W_NONE = 0, FW_W_CALL = 1 }; // 移除死代码 FW_W_REG；移除无动作的 FW_W_FIND
 #define FW_WAITING 1 // 异步等待中（正值，与负值错误码区分）
 typedef struct fw_waiter {
   int kind;
@@ -123,11 +123,11 @@ typedef struct {
   uint16_t port;
   int session_strm;        // 0=未分配
   char retrans_key[224];
-  // [REVIEW P1-1] 移除 cancel_deadline：unsubscribe 改用独立取消等待表（cancels），
+  // 移除 cancel_deadline：unsubscribe 改用独立取消等待表（cancels），
   // 避免会话立即移除导致的槽位覆盖丢失（原实现把 deadline 写在即将被 swap 覆盖的槽位）
 } fw_session_t;
 
-// ---------- 订阅取消等待（§8.1 场景4；[REVIEW P1-1] 对齐 fw-nodejs cancelPending） ----------
+// ---------- 订阅取消等待（§8.1 场景4；对齐 fw-nodejs cancelPending） ----------
 // unsubscribe 后会话立即从 sessions 移除（应用视角完成），但取消确认 ACK(0x00)
 // 到达前会话 StrmID 仍活跃——保留于此表直至确认释放/重传耗尽兜底释放（§6.1/6.5）
 typedef struct {
@@ -196,7 +196,7 @@ typedef struct {
   fw_disc_rec_t *disc; int ndisc, disc_cap;
   fw_session_t *sessions; int nsess, sess_cap;
   uint32_t handle_seq;
-  fw_cancel_pend_t *cancels; int ncxl, cxlcap; // [REVIEW P1-1] 取消等待表（ACK(0x00) 前保留会话 StrmID）
+  fw_cancel_pend_t *cancels; int ncxl, cxlcap; // 取消等待表（ACK(0x00) 前保留会话 StrmID）
   fw_pend_find_t *pf; int npf, pfcap;
   fw_idl_query_t *queries; int nq, qcap;
   fw_ack_cache_t *ack; int nack, ackcap;
@@ -207,7 +207,7 @@ typedef struct {
 // ---------- rpc 模块状态（§5.1/§5.2/§5.5） ----------
 enum { FW_STAGE_RESOLVE = 0, FW_STAGE_SEND = 1, FW_STAGE_WAIT = 2 };
 
-// [REVIEW P3-12] 补 tag fw_call_ctx：与文件头前置声明/next·anext 字段声明的
+// 补 tag fw_call_ctx：与文件头前置声明/next·anext 字段声明的
 // struct fw_call_ctx 为同一类型（原匿名 typedef 与前置声明类型分裂）
 typedef struct fw_call_ctx {
   uint16_t svc_id;
@@ -235,7 +235,7 @@ typedef struct fw_call_ctx {
   uint32_t timeout_ms;     // 本次调用响应超时（0=默认 response_timeout_ms，附录 A）
   int rst_code;            // 收到 RST 的具体码（FW_ERR_RST 时 fw_result_t.rst_code）
   struct fw_call_ctx *next;
-  struct fw_call_ctx *anext; // [REVIEW P3-12] 全量活动 ctx 注册链（stop 时 flush 未完成 async 回调）
+  struct fw_call_ctx *anext; // 全量活动 ctx 注册链（stop 时 flush 未完成 async 回调）
 } fw_call_ctx_t;
 
 // 服务端响应缓存（§5.5 去重：重复 CON 请求重发缓存响应）
@@ -251,7 +251,7 @@ typedef struct {
   fw_retrans_table_t retrans;
   fw_call_ctx_t *pending;    // wait 阶段调用链表
   fw_call_ctx_t *ff_pending; // UDP ff 等 ACK 链表
-  fw_call_ctx_t *active;     // [REVIEW P3-12] 全量活动调用注册链（含 resolve 阶段 async ctx）
+  fw_call_ctx_t *active;     // 全量活动调用注册链（含 resolve 阶段 async ctx）
   fw_resp_cache_t *cache; int ncache, cachecap;
 } fw_rpc_t;
 
@@ -301,7 +301,7 @@ struct fw_stack {
   uint16_t client_port;
   fw_fd_t tcp_listen;
   fw_tcpconn_t **conns; int nconn, conncap;
-  // 本机地址集（自我回环过滤；[REVIEW P3-11] 平台枚举扩容 8→16）
+  // 本机地址集（自我回环过滤；平台枚举扩容 8→16）
   char local_addrs[16][48]; int nlocal;
   // 定时
   int64_t last_offer_ms, last_tick_ms;
@@ -382,12 +382,12 @@ fw_local_t *fw_disc_get_local(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id);
 // 客户端查询
 fw_disc_rec_t *fw_disc_get_discovered(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id);
 int fw_disc_online_major_ver(fw_stack_t *st, uint16_t svc_id); // -1=无在线实例
-// [REVIEW P3-9] 订阅者快照改堆分配（原 static[64] 硬上限静默截断）：*out 由调用者 free
+// 订阅者快照改堆分配（原 static[64] 硬上限静默截断）：*out 由调用者 free
 void fw_disc_subscribers_of(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, uint16_t if_id,
                             fw_sub_rec_t **out, int *out_n);
 void fw_disc_on_subscription_added(fw_stack_t *st, const fw_meta_t *meta,
                                    const fw_sub_entry_t *entries, int n);
-// [REVIEW P3-9] 组成员列表改堆分配（原调用方 out[64] 硬上限）：*out 由调用者 free
+// 组成员列表改堆分配（原调用方 out[64] 硬上限）：*out 由调用者 free
 void fw_disc_group_members(fw_stack_t *st, uint16_t svc_id, uint8_t grp_id,
                            uint16_t **out, int *out_n);
 
@@ -404,7 +404,7 @@ uint32_t fw_disc_subscribe(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,
                            uint16_t if_id, uint8_t grp_id, fw_event_cb cb, void *ud);
 int fw_disc_unsubscribe(fw_stack_t *st, uint32_t handle);
 void fw_disc_session_tick(fw_stack_t *st, int64_t now); // 订阅保活 + 取消兜底（§7.2/§8.1）
-// [REVIEW P3-5] 移除死声明 fw_disc_cancel_tick（无实现，取消兜底由 session_tick 承担）
+// 移除死声明 fw_disc_cancel_tick（无实现，取消兜底由 session_tick 承担）
 
 // find（客户端）
 int fw_disc_find(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,
@@ -433,7 +433,7 @@ fw_call_ctx_t *fw_call_ctx_new(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id,
 void fw_call_ctx_free(fw_stack_t *st, fw_call_ctx_t *ctx);
 // call ctx 从 pending/ff_pending 链表摘除（放弃等待时防悬空，§5 状态机）
 void fw_call_detach(fw_stack_t *st, fw_call_ctx_t *ctx);
-// [REVIEW P3-12] stop 前冲刷全部未完成调用：async ctx 以 err 触发回调（不悬挂）
+// stop 前冲刷全部未完成调用：async ctx 以 err 触发回调（不悬挂）
 void fw_rpc_flush_all_pending(fw_stack_t *st, int err, const char *msg);
 
 // ---- events（events/events.c） ----

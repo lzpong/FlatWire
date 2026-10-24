@@ -73,7 +73,7 @@ pub fn concat_bytes(a : Bytes, b : Bytes) -> Bytes {
   out.to_bytes()
 }
 
-/// 测试：MSK 两次 XOR 还原（测试用例 1.28）
+/// 测试：MSK 两次 XOR 还原（测试用例 1.30）
 test "masking xor roundtrip" {
   let data = b"\x01\x02\x03\x04\x05"
   let key = b"\xA5\x5A\x00\xFF"
@@ -82,7 +82,7 @@ test "masking xor roundtrip" {
   assert_eq(restored, data)
 }
 
-/// 测试：CRC 附加与校验剥离往返（测试用例 1.29/1.31）
+/// 测试：CRC 附加与校验剥离往返（测试用例 1.31）
 test "crc append & verify" {
   let data = b"123456789"
   let with_crc = append_crc16(data)

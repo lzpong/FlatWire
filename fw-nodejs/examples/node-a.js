@@ -34,12 +34,11 @@ const idlText = readFileSync(new URL('./vehicle-state.idl.json', import.meta.url
 const state = {
   veh_md: 1,              // 车辆模式
   usg_md: 2,              // 使用模式
-  sys_pwr_md: 2,          // 电源模式（signed）
-  timestamp: Date.now(),  // 毫秒时间戳（§9.1 timestamp）
-  timestr: '2026-10-13T12:00:00Z', // fixed_len=20，恰 20 字节
+  sys_pwr_md: 2,          // 电源模式（i8，v5 §9.2）
+  timestamp: Date.now(),  // 毫秒时间戳（§9.2 timestamp 6B）
+  timestr: '2026-10-13T12:00:00Z', // fixed_len=20，恰 20 字节（无长度前缀）
   status_msg: 'all systems nominal',
-  diag_note: null,        // optional 字段：null 编码为 1B 空头（§9.2）
-  ratio: 0.618,           // float64
+  ratio: 0.618,           // f64
 };
 
 // ---- 协议栈启动 + 注册（§13.1） ----
@@ -83,7 +82,7 @@ const pushTimer = setInterval(() => {
   state.timestamp = Date.now();
   state.ratio = Math.round((seq % 10) * 0.1 * 1000) / 1000;
   stack.notify(4096, 1, 32769, { ...state });   // event output=VehicleState（§8.2）
-  stack.notify(4096, 1, 32770, 2);              // event output=PowerMode（enum 线格式=底层整型，§11.1）
+  stack.notify(4096, 1, 32770, 2);              // event output=PowerMode（v5 §9.2：enum 线格式 = base 整型裸值，u8 1B）
   seq++;
 }, 3000);
 pushTimer.unref?.();

@@ -1,11 +1,11 @@
-﻿// ============================================================
+// ============================================================
 // node_b —— 示例客户端：发现 → GetIDL 自动拉取 → 调用 → 订阅（实现计划 §5 场景）
 //
 // 验证点（输出带 [VERIFY] 标记，冒烟脚本检查）：
 //   1. 服务发现：is_available(4096,1) → true（启动预热 Find + 组播 Offer，§7.2/§7.4）
 //   2. GetIDL 自动拉取落盘：本地 IDL 库为空 → call 触发协议栈内部 GetIDL（§7.2）
 //      → 库内出现 4096_v1.json（重启后本地命中不重复拉取）
-//   3. rpc call 往返：GetState 返回 VehicleState 结构（[VArray(8 字段值)]，§9.3）
+//   3. rpc call 往返：GetState 返回 VehicleState 结构（[VArray(7 字段值)]，§9.4）
 //   4. fire_forget：UpdateState / UploadBlob 到达（TCP 全 NON 无确认，§5.2）
 //   5. 订阅确认链路 + 事件推送：Subscribe(CON) → ACK(0x10) → 交付推送（§8.1）
 //   6. REN 感知：服务端优雅退出（REN×3）→ is_available 变 false（§3.6/§4.6）
@@ -140,20 +140,19 @@ fn main {
       let idl_name = "4096_v1.json"
       app_log("[NodeB] local IDL store empty: \{!app_file_exists(idl_dir, idl_name)}")
       stack.call(4096, 1, 1, [], 0, fn(vs) {
-        // GetState 无输入；响应 = [VArray(VehicleState 8 字段值)]（§9.3）
+        // GetState 无输入；响应 = [VArray(VehicleState 7 字段值)]（§9.4）
         app_log("[VERIFY-2] GetIDL persisted: \{app_file_exists(idl_dir, idl_name)}")
         app_log("[VERIFY-3] rpc GetState -> \{Repr(vs)}")
         // ---- 4. fire_forget（TCP 全 NON，无传输确认，§5.2）----
-        // UpdateState：input=[VehicleState] → [VArray(8 字段值)]（diag_note 传非 null 演示 optional 编码）
+        // UpdateState：input=[VehicleState] → [VArray(7 字段值)]（v5.0 全部字段必填，无 optional）
         stack.fire_forget(4096, 1, 2, [
           @codec.VArray([
-            @codec.VUnsigned(1), // veh_md
-            @codec.VUnsigned(2), // usg_md
-            @codec.VSigned(3L), // sys_pwr_md
+            @codec.VUInt(1), // veh_md
+            @codec.VUInt(2), // usg_md
+            @codec.VSInt(3L), // sys_pwr_md
             @codec.VTimestamp(app_now_ms(0).to_int64()), // timestamp
             @codec.VString("2026-10-13T12:30:00Z"), // timestr（fixed 20B）
             @codec.VString("updated by NodeB"), // status_msg
-            @codec.VString("demo"), // diag_note（optional 非 null）
             @codec.VFloat(0.717), // ratio
           ]),
         ], fn(e) { app_log("[NodeB] ff UpdateState error: \{Repr(e)}") })

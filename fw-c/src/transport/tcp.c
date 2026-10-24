@@ -305,7 +305,7 @@ static void conn_finish_connect(fw_stack_t *st, fw_tcpconn_t *c) {
   int err = 0;
   socklen_t elen = sizeof(err);
   getsockopt(c->fd, SOL_SOCKET, SO_ERROR, (char *)&err, &elen);
-  // [REVIEW P3-2] 降 DEBUG：connect 未完成时每轮 poll 都会打印，属日志风暴源
+  // 降 DEBUG：connect 未完成时每轮 poll 都会打印，属日志风暴源
   fw_log(FW_LOG_DEBUG, "tcp", "finish_connect check: %s err=%d", c->addrkey, err);
   if (err != 0 && fw_plat_would_block()) return; // connect 未完成（勿误判失败）
   if (err != 0) {
@@ -327,7 +327,7 @@ static void conn_read(fw_stack_t *st, fw_tcpconn_t *c) {
     if (n > 0) {
       int was_receiving = fw_sp_receiving(&c->parser);
       c->last_recv_ms = fw_now_ms(); // §5.7：收到任意帧（字节）即刷新存活计时
-      // [REVIEW P3-8] feed 失败（realloc 不足）→ 连接数据流不可靠，关闭连接
+      // feed 失败（realloc 不足）→ 连接数据流不可靠，关闭连接
       if (fw_sp_feed(&c->parser, buf, (size_t)n) != FW_OK) {
         fw_tcp_conn_close(st, c);
         return;
@@ -357,7 +357,7 @@ void fw_tcp_poll(fw_stack_t *st) {
     fw_tcpconn_t *c = st->conns[i];
     if (!c || c->closed) continue;
     if (c->connecting) {
-      // [REVIEW P3-2] 降 DEBUG：每轮 poll（20ms）对 connecting 连接打印 INFO 形成
+      // 降 DEBUG：每轮 poll（20ms）对 connecting 连接打印 INFO 形成
       // 建连期间日志风暴（conn_finish_check 的同类日志一并降级）
       fw_log(FW_LOG_DEBUG, "tcp", "poll connecting conn %s", c->addrkey);
       conn_finish_connect(st, c);
