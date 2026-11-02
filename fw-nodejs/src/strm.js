@@ -71,10 +71,11 @@ export class StrmPool {
   /** 是否活跃 */
   isActive(id) { return this.active.has(id); }
 
-  /** 收到 REN=1：清除该对端全部序列（§3.6/§6.3） */
+  /** 收到 REN=1：清除该对端全部序列并重置分配游标（§3.6/§6.3） */
   reset() {
     this.active.clear();
     this.releaseSeq.clear();
+    this.allocSeq = 0; // 游标归零，后续分配从池起点重新开始
   }
 
   /** 活跃数量（测试/观测用） */
@@ -133,12 +134,16 @@ export class StrmManager {
     return this._ctrlPools.get(peer)?.isActive(strmId) ?? false;
   }
 
-  /** 收到 REN=1：清除该对端全部序列并重置游标（§3.6） */
+  /** 收到 REN=1：清除该对端全部序列并重置游标（§3.6）
+   *  peer 可能是完整 "ip:port"，也可能是上层传入的 "ip:" 前缀（按节点清理）；
+   *  因此统一用 startsWith(peer) 匹配数据池 key 与控制池 key，避免漏清。 */
   resetPeer(peer) {
     for (const key of this._dataPools.keys()) {
-      if (key.startsWith(peer + '|')) this._dataPools.get(key).reset();
+      if (key.startsWith(peer)) this._dataPools.get(key).reset();
     }
-    this._ctrlPools.get(peer)?.reset();
+    for (const key of this._ctrlPools.keys()) {
+      if (key.startsWith(peer)) this._ctrlPools.get(key).reset();
+    }
   }
 
   _dataPool(peer, svcId, instId, base) {

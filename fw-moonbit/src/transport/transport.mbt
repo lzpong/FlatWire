@@ -202,6 +202,16 @@ pub fn Transport::stop(self : Transport) -> Unit {
   self.started = false
 }
 
+/// 组播候选判定（平台无法获知 UDP 目的地址，以帧头启发式区分）
+/// 只有控制帧内的 Offer/Find/REN 才可能是组播；数据帧（CTR=0）一律按单播处理，
+/// 否则 Request/FF 的解析违规会被错误静默（§1.2/§4.3）。
+fn is_multicast_like(h : @frame.FrameHeader) -> Bool {
+  if !h.ctr {
+    return false
+  }
+  h.code == 0x01 || h.code == 0x02 || (h.ren && h.code == 0x00)
+}
+
 /// UDP 收包处理（§4.2/§4.3/§4.4）：解析 → 交付 / 回 RST / 静默丢弃
 fn Transport::handle_udp(
   self : Transport,
@@ -214,12 +224,18 @@ fn Transport::handle_udp(
     // §4.3 步骤 8：合法帧交付上层（from_server 标志供上层区分组播候选/单播）
     Ok(frame) => (self.on_event)(UdpFrame(frame, host, port, from_server))
     Reject(code, hdr) => {
-      // §4.4：组播帧静默丢弃。server socket 可能收到组播帧（目的地址不可判定）→ 保守静默；
-      // client socket 仅收单播 → 回 RST(code)，回显触发帧 ID（§5.4）
-      if !from_server {
+      // §4.4：组播帧静默丢弃。目的地址不可判定 → 用帧头启发式：
+      // Offer/Find/REN 静默；其余（含全部数据帧）回 RST(code)，从收到帧的 socket 发出。
+      // hdr 缺失（无法提取帧头）时沿用 socket 身份判断。
+      let multicast = match hdr {
+        Some(h) => is_multicast_like(h)
+        None => from_server
+      }
+      if !multicast {
         let raw = make_rst_frame(code, hdr)
         if raw.length() > 0 {
-          ffi_udp_send(self.client_idx, raw, host, port)
+          let idx = if from_server { self.server_idx } else { self.client_idx }
+          ffi_udp_send(idx, raw, host, port)
         }
       }
     }

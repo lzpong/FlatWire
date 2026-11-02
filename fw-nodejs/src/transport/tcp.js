@@ -64,7 +64,6 @@ export class TcpConn {
   // ---- 接收 ----
 
   _onData(chunk) {
-    const wasReceiving = this.parser.isReceiving();
     this.parser.feed(chunk);
     this.lastRecvAt = Date.now(); // §5.7：收到任意帧（字节）即刷新存活计时
 
@@ -73,10 +72,12 @@ export class TcpConn {
       this._startDropTimer();
       return;
     }
-    if (!wasReceiving && this.parser.isReceiving()) {
-      this._startFrameTimer(); // 新帧开始接收 → 启动半帧超时
-    }
-    if (!this.parser.isReceiving()) {
+    // 只要仍处于"接收中"就必须有半帧计时器。不能仅凭 feed 前的 receiving 判断：
+    // 丢弃模式在同一批数据中收满 R 字节后可能立刻进入一个新半帧，此时 feed 前
+    // wasReceiving 为 true，会漏启计时器导致半帧永久悬挂。
+    if (this.parser.isReceiving()) {
+      if (!this._frameTimer) this._startFrameTimer();
+    } else {
       this._clearFrameTimer(); // 帧已完整交付 → 停止半帧计时
     }
   }

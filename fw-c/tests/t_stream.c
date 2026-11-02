@@ -129,13 +129,13 @@ int suite_stream(void) {
   fw_sp_feed(&p, buf, 10); // 帧头完整（12B 帧只发 10B）→ 帧头完整、Payload 不完整
   CHECK_EQ_INT(fw_sp_receiving(&p), 1);
   CHECK_EQ_INT(fw_sp_header_complete(&p), 1);
-  uint32_t total = 0, recv = 0;
+  uint64_t total = 0, recv = 0; // §3.2：帧总长/已收字节为 64 位
   fw_sp_frame_info(&p, &total, &recv);
-  CHECK_EQ_INT(total, 12);
-  CHECK_EQ_INT(recv, 10);
+  CHECK_EQ_U64(total, 12);
+  CHECK_EQ_U64(recv, 10);
   // 半帧超时（阶段二）：进入丢弃模式
-  uint32_t remain = fw_sp_enter_drop_mode(&p, 1000);
-  CHECK_EQ_INT(remain, 2); // R = L − 已收
+  uint64_t remain = fw_sp_enter_drop_mode(&p, 1000);
+  CHECK_EQ_U64(remain, 2); // R = L − 已收
   CHECK_EQ_INT(fw_sp_receiving(&p), 1);
   CHECK_EQ_INT(p.drop_mode, 1);
   // 发完剩余 2 字节 → 恢复 IDLE（退出条件 1）
@@ -179,6 +179,36 @@ int suite_stream(void) {
   make_frame(buf, sizeof(buf), 1, pl1, 3);
   fw_sp_feed(&p, buf, 12);
   CHECK_EQ_INT(g_nframes, 1); // 违规帧被精确跳过，后续帧正常
+  fw_sp_free(&p);
+  TEST_END();
+
+  TEST_BEGIN("§3.2 超大声明长度：丢弃剩余 R 按 64 位计算（不截断）");
+  reset_cb_state();
+  fw_sp_init(&p);
+  p.on_frame = on_frame;
+  p.on_rst = on_rst;
+  {
+    // PLB=7，声明 Payload = 2^40：帧头完整后解析器应停在等待状态，
+    // 阶段二丢弃模式的 R 必须等于声明总长 − 已收，不能用 32 位截断值。
+    uint8_t hb[15];
+    memset(hb, 0, sizeof(hb));
+    hb[0] = 0x07; // CTR=0 REN=0 VER=0 MSK=0 PLB=7
+    hb[1] = (uint8_t)((FW_TYP_NON << 6) | FW_CODE_REQUEST);
+    hb[2] = 0; hb[3] = 1; hb[4] = 0; hb[5] = 1; hb[6] = 1; hb[7] = 1;
+    const uint64_t plen = (uint64_t)1 << 40;
+    for (int i = 0; i < 7; i++) hb[8 + i] = (uint8_t)((plen >> (8 * (6 - i))) & 0xFF);
+    fw_sp_feed(&p, hb, sizeof(hb));
+  }
+  CHECK_EQ_INT(fw_sp_receiving(&p), 1);
+  CHECK_EQ_INT(fw_sp_header_complete(&p), 1);
+  {
+    uint64_t total = 0, recv = 0;
+    fw_sp_frame_info(&p, &total, &recv);
+    CHECK_EQ_U64(total, (uint64_t)15 + ((uint64_t)1 << 40));
+    CHECK_EQ_U64(recv, 15);
+    uint64_t remain = fw_sp_enter_drop_mode(&p, 1000);
+    CHECK_EQ_U64(remain, (uint64_t)1 << 40); // R = L − 已收，64 位无损
+  }
   fw_sp_free(&p);
   TEST_END();
 

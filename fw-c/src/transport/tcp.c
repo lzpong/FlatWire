@@ -326,14 +326,18 @@ static void conn_read(fw_stack_t *st, fw_tcpconn_t *c) {
     int n = (int)recv(c->fd, (char *)buf, sizeof(buf), 0);
     if (n > 0) {
       int was_receiving = fw_sp_receiving(&c->parser);
+      int was_dropping = c->parser.drop_mode; // feed 前是否处于丢弃模式（§4.1 阶段二）
       c->last_recv_ms = fw_now_ms(); // §5.7：收到任意帧（字节）即刷新存活计时
       // feed 失败（realloc 不足）→ 连接数据流不可靠，关闭连接
       if (fw_sp_feed(&c->parser, buf, (size_t)n) != FW_OK) {
         fw_tcp_conn_close(st, c);
         return;
       }
-      // 半帧计时起点：receiving 跳变记录（§4.1 帧开始接收）
-      if (!was_receiving && fw_sp_receiving(&c->parser) && !c->parser.drop_mode)
+      // 半帧计时起点：receiving 跳变记录（§4.1 帧开始接收）。
+      // 丢弃模式在同一批数据收满 R 字节后可能立即开始新半帧，此时 was_receiving
+      // 仍为真（fw_sp_receiving 包含 drop_mode），必须显式用 was_dropping 重置
+      // 起点，否则 frame_start_ms 保留旧帧时刻，新半帧会被立即判定超时。
+      if (fw_sp_receiving(&c->parser) && !c->parser.drop_mode && (!was_receiving || was_dropping))
         c->frame_start_ms = fw_now_ms();
       // 丢弃模式每收任意字节刷新兜底计时（§4.1 退出条件 3）
       if (c->parser.drop_mode) c->parser.drop_last_ms = fw_now_ms();

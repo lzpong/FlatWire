@@ -80,9 +80,13 @@ pub fn validate_header(h : FrameHeader, local_ver : Int, is_tcp : Bool) -> Int? 
   if !is_tcp && h.ctr && h.code == 0x04 {
     return Some(@errors.RST_OK)
   }
-  // 传输控制帧（CTR=0 且 ACK/RST）豁免步骤 3/4 ID 校验（文件头注释）
-  let is_ctrl_transport = !h.ctr && (h.typ == Ack || h.typ == Rst)
-  if !is_ctrl_transport {
+  // 仅 TYP=RST 豁免步骤 3/4 的 ID 校验（§4.3 步骤 3/4 / §5.4）：
+  // RST 的 SvcID/IfID/InstID/StrmID 是回显字段，取值可能超出控制帧或数据帧的
+  // 合法范围（数据帧触发时 StrmID 可达 0xFE、SvcID/IfID 可能为 0x0000）。
+  // RST 自身也可能是数据帧（CTR=0），故任何 TYP=RST 均豁免（不区分 CTR）。
+  // 数据帧 ACK（CTR=0）不豁免：其回显 ID 必须落在合法范围，否则步骤 3/4 回 RST(0x00)。
+  let exempt_step34 = h.typ == Rst
+  if !exempt_step34 {
     // §4.3 步骤 3：SvcID/IfID
     if h.ctr {
       // 控制帧 SvcID=0x0000 且 IfID=0x0000（测试 2.13）

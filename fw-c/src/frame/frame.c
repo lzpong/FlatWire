@@ -180,30 +180,33 @@ fw_parse_state_t fw_parse_header(const uint8_t *buf, size_t avail, size_t offset
   uint8_t inst = buf[6];
   uint8_t strm = buf[7];
 
-  if (ctr == 1) {
-    // 控制帧 SvcID=0x0000 且 IfID=0x0000（§4.3 步骤 3）
-    if (svc != 0 || ifc != 0) {
-      fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr);
-      return FW_PARSE_INVALID;
-    }
-  } else {
-    // 数据帧 SvcID≠0 且 IfID≠0（ID=0 通配仅 SD Entry 场景，§3.5）
-    if (svc == 0 || ifc == 0) {
-      fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr);
-      return FW_PARSE_INVALID;
-    }
-  }
-
-  // ---- 步骤 4：InstID/StrmID 校验 ----
-  if (ctr == 1) {
-    // 控制帧 InstID=0、REN=1 时 StrmID=0（§4.3 步骤 4）
-    if (inst != 0) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
-    if (ren == 1 && strm != 0) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
-    if (typ == FW_TYP_RST) {
-      // RST 帧豁免 StrmID 校验（实现裁定，见 fw-nodejs README 偏差 2）：StrmID 是 §5.4
-      // 回显字段（数据帧触发时可达 0xFF）——若按控制帧语义校验，会形成
-      // "RST 判违规 → 回 RST → 对端再判违规"的互射风暴
+  // ---- 步骤 3/4 豁免：任何 TYP=RST 都不校验 ID（§4.3 步骤 3/4 / §5.4） ----
+  // RST 的 SvcID/IfID/InstID/StrmID 是回显字段，取值来自触发帧，可能超出控制帧
+  // 或数据帧的合法范围（数据帧触发时 StrmID 可达 0xFE、SvcID/IfID 可能为 0x0000）。
+  // RST 自身也可能是数据帧（CTR=0），回显越界 ID 同样合法，因此不区分 CTR=1
+  // （控制帧）/CTR=0（数据帧）。若仍按步骤 3/4 校验，双方会"RST 判违规 → 回 RST
+  // → 对端再判违规"，形成 RST 回环风暴。
+  // RST 的形态与 Code 值域已在步骤 2 校验，此处仅豁免 ID 相关校验。
+  if (typ != FW_TYP_RST) {
+    if (ctr == 1) {
+      // 控制帧 SvcID=0x0000 且 IfID=0x0000（§4.3 步骤 3）
+      if (svc != 0 || ifc != 0) {
+        fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr);
+        return FW_PARSE_INVALID;
+      }
     } else {
+      // 数据帧 SvcID≠0 且 IfID≠0（ID=0 通配仅 SD Entry 场景，§3.5）
+      if (svc == 0 || ifc == 0) {
+        fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr);
+        return FW_PARSE_INVALID;
+      }
+    }
+
+    // ---- 步骤 4：InstID/StrmID 校验 ----
+    if (ctr == 1) {
+      // 控制帧 InstID=0、REN=1 时 StrmID=0（§4.3 步骤 4）
+      if (inst != 0) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
+      if (ren == 1 && strm != 0) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
       // 控制帧 StrmID 范围：0x00（连接级）或 0x01~0x7F（会话/查询）→ 否则 RST(0x00)
       if (strm > 0x7F) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
       // 控制帧 StrmID 语义校验（§4.3 步骤 4）：
@@ -222,12 +225,12 @@ fw_parse_state_t fw_parse_header(const uint8_t *buf, size_t avail, size_t offset
           return FW_PARSE_INVALID;
         }
       }
+    } else {
+      // 数据帧 InstID≠0x00（§4.3 步骤 4）
+      if (inst == 0) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
+      // 数据帧 StrmID∈0x01~0xFE（0x00 连接级禁用、0xFF 保留，§6.1）→ 越界 RST(0x00)
+      if (strm < 0x01 || strm > 0xFE) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
     }
-  } else {
-    // 数据帧 InstID≠0x00（§4.3 步骤 4）
-    if (inst == 0) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
-    // 数据帧 StrmID∈0x01~0xFE（0x00 连接级禁用、0xFF 保留，§6.1）→ 越界 RST(0x00)
-    if (strm < 0x01 || strm > 0xFE) { fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr); return FW_PARSE_INVALID; }
   }
 
   // ---- 步骤 5：读 Payload Length（plb 字节）；PLB=0 时 Length=0 ----
@@ -255,8 +258,10 @@ fw_parse_state_t fw_parse_header(const uint8_t *buf, size_t avail, size_t offset
   out->inst_id = inst;
   out->strm_id = strm;
   out->header_len = header_len;
-  out->payload_len = (uint32_t)payload_len;
-  out->expected_total = header_len + (uint32_t)payload_len;
+  // §3.2：Length 按 64 位语义原样保留，不做 32 位截断——
+  // 截断会使 expected_total 变小，导致帧边界错位、把后续帧字节误当 Payload。
+  out->payload_len = payload_len;
+  out->expected_total = (uint64_t)header_len + payload_len;
   out->mask_key = msk ? (buf + 8 + plb) : NULL;
   return FW_PARSE_OK;
 }
@@ -275,8 +280,9 @@ fw_parse_state_t fw_parse_datagram(uint8_t *buf, size_t len, const fw_parse_opts
     if (st == FW_PARSE_INVALID && rst) *rst = h;
     return st;
   }
-  // §4.2：数据报长度 ≠ 帧头声明长度（多余或不足）→ 一律丢弃（不做截断）
-  if (len != h.expected_total) return FW_PARSE_SILENT;
+  // §4.2：数据报长度 ≠ 帧头声明长度（多余或不足）→ 一律丢弃（不做截断）。
+  // 统一按 64 位比较：len 为 size_t，h.expected_total 为 uint64_t。
+  if ((uint64_t)len != h.expected_total) return FW_PARSE_SILENT;
 
   // 步骤 7：读 Payload；MSK=1 则 XOR 还原（就地，§10 编解码对称）
   if (h.msk && h.payload_len) fw_mask_xor(buf + h.header_len, h.payload_len, h.mask_key);
@@ -329,9 +335,9 @@ static void sp_consume(fw_stream_parser_t *p, size_t n) {
 static void sp_consume_drop(fw_stream_parser_t *p) {
   while (p->drop_mode && p->drop_remaining > 0) {
     if (p->len == 0) return; // 待丢弃字节未到齐，等待后续 feed
-    size_t n = p->len < p->drop_remaining ? p->len : (size_t)p->drop_remaining;
+    size_t n = (p->len < p->drop_remaining) ? p->len : (size_t)p->drop_remaining;
     sp_consume(p, n); // 从 buf 头部精确消耗（后续 feed 字节持续追加）
-    p->drop_remaining -= (uint32_t)n;
+    p->drop_remaining -= (uint64_t)n;
   }
   if (p->drop_mode && p->drop_remaining == 0) {
     // 退出条件 1：收满剩余 R 字节 → 恢复正常接收（连接继续复用，§4.1）
@@ -404,9 +410,10 @@ static void sp_loop(fw_stream_parser_t *p) {
       if (p->len >= head_len) {
         uint64_t plen = 0;
         for (int i = 0; i < plb; i++) plen = (plen << 8) | p->buf[8 + i];
-        size_t total = head_len + (size_t)plen;
-        if (p->len >= total) {
-          sp_consume(p, total); // 跳过违规帧，继续解析后续帧
+        // 64 位比较，避免 32 位平台 size_t 溢出后误判"已收齐"并跳过错误字节数
+        uint64_t total = (uint64_t)head_len + plen;
+        if ((uint64_t)p->len >= total) {
+          sp_consume(p, (size_t)total); // 跳过违规帧，继续解析后续帧
           p->receiving = 0;
           p->header_done = 0;
           skipped = 1;
@@ -425,12 +432,20 @@ static void sp_loop(fw_stream_parser_t *p) {
     // FW_PARSE_OK：帧头已解析，等 Payload
     p->head = h;
     p->header_done = 1;
-    if (p->len < h.expected_total) {
-      p->received = (uint32_t)p->len; // 当前帧已收字节（此前帧均已消费）
+    if ((uint64_t)p->len < h.expected_total) {
+      p->received = (uint64_t)p->len; // 当前帧已收字节（此前帧均已消费）
       return; // 分包：保存状态等待（§4.1）
     }
     // 收齐：交付（ver 随帧传出，与 parse_datagram 交付口径一致）
     fw_frame_t f;
+    // §3.2 实现承载上限：交付结构 payload_len 为 uint32，声明长度超过 2^32−1 时
+    // 不得截断成小值交付（否则应用会按错误长度读取并越界）。此处显式放弃本帧，
+    // 保持 receiving/header_done，由连接层半帧超时进入丢弃模式兜底。
+    if (h.payload_len > 0xFFFFFFFFu) {
+      fw_log(FW_LOG_ERROR, "frame", "declared payload %llu exceeds delivery limit (2^32-1), frame abandoned",
+             (unsigned long long)h.payload_len);
+      return;
+    }
     memset(&f, 0, sizeof(f));
     f.ver = h.ver;
     f.ctr = h.ctr;
@@ -442,31 +457,31 @@ static void sp_loop(fw_stream_parser_t *p) {
     f.if_id = h.if_id;
     f.inst_id = h.inst_id;
     f.strm_id = h.strm_id;
-    f.payload_len = h.payload_len;
+    f.payload_len = (uint32_t)h.payload_len; // 已在上方按 2^32−1 上限校验，无截断风险
     if (h.payload_len) {
       // 交付前拷贝 payload 到暂存缓冲：sp_consume 的 memmove 会挪动解析缓冲，
       // 粘包时下一帧字节将覆盖未交付的当前帧 payload（交付数据与缓冲解耦）。
-      if (p->scratch_cap < h.payload_len) {
+      if (p->scratch_cap < (size_t)h.payload_len) {
         size_t nc = p->scratch_cap ? p->scratch_cap : 256;
-        while (nc < h.payload_len) nc *= 2;
+        while (nc < (size_t)h.payload_len) nc *= 2;
         uint8_t *ns = (uint8_t *)realloc(p->scratch, nc);
         if (!ns) {
           // 失败记日志（原静默返回，依赖后续 feed 重试）
-          fw_log(FW_LOG_ERROR, "frame", "sp scratch realloc failed (%uB frame abandoned)",
-                 h.payload_len);
+          fw_log(FW_LOG_ERROR, "frame", "sp scratch realloc failed (%lluB frame abandoned)",
+                 (unsigned long long)h.payload_len);
           return; // 内存不足：放弃本帧（连接层半帧超时兜底）
         }
         p->scratch = ns;
         p->scratch_cap = nc;
       }
-      memcpy(p->scratch, p->buf + h.header_len, h.payload_len);
+      memcpy(p->scratch, p->buf + h.header_len, (size_t)h.payload_len);
       if (h.msk) {
         // MSK=1：XOR 还原（在暂存副本上执行，§10 编解码对称）
-        fw_mask_xor(p->scratch, h.payload_len, h.mask_key);
+        fw_mask_xor(p->scratch, (size_t)h.payload_len, h.mask_key);
       }
       f.payload = p->scratch;
     }
-    sp_consume(p, h.expected_total);
+    sp_consume(p, (size_t)h.expected_total);
     p->receiving = 0;
     p->header_done = 0;
     p->received = 0;
@@ -478,14 +493,14 @@ int fw_sp_receiving(const fw_stream_parser_t *p) { return p->receiving || p->dro
 
 int fw_sp_header_complete(const fw_stream_parser_t *p) { return p->header_done; }
 
-void fw_sp_frame_info(const fw_stream_parser_t *p, uint32_t *total, uint32_t *recv) {
+void fw_sp_frame_info(const fw_stream_parser_t *p, uint64_t *total, uint64_t *recv) {
   *total = p->header_done ? p->head.expected_total : 0;
   *recv = p->received;
 }
 
 // 进入丢弃模式（帧头完整、Payload 不完整，§4.1 阶段二）。
 // 已收的当前帧字节立即全部作废；剩余 R = L − 已收 从后续到达字节精确消耗。
-uint32_t fw_sp_enter_drop_mode(fw_stream_parser_t *p, int64_t now_ms) {
+uint64_t fw_sp_enter_drop_mode(fw_stream_parser_t *p, int64_t now_ms) {
   if (!p->header_done) return 0;
   p->drop_mode = 1;
   p->drop_remaining = p->head.expected_total - p->received;

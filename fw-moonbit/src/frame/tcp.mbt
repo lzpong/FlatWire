@@ -29,7 +29,7 @@ priv enum TcpState {
   StLength // 收集 plb 字节 Length
   StMask // 收集 4B Masking Key
   StPayload // 收集 Length 字节的 Payload
-  StDropping(Int) // 丢弃模式：剩余 R 字节
+  StDropping(Int64) // 丢弃模式：剩余 R 字节（64 位，Length 语义见 §3.2）
 }
 
 /// TCP 流式帧解析器（每条 TCP 连接一个实例）
@@ -42,7 +42,7 @@ pub struct TcpFrameParser {
   priv mask_buf : Array[Byte] // 已收 Mask Key 字节
   priv payload_buf : Array[Byte] // 已收 Payload 字节
   priv mut hdr : FrameHeader? // 8B 收齐后的帧头
-  priv mut cur_length : Int // Length 收齐后的声明 Payload 长度
+  priv mut cur_length : Int64 // Length 收齐后的声明 Payload 长度（§3.2 64 位语义，不截断）
   priv mut violated : Bool // 帧头校验失败：收完不交付（保流对齐）
   priv mut frame_start_ms : Int64 // 当前帧开始接收时刻（半帧计时起点）
   priv mut drop_last_ms : Int64 // 丢弃模式最后收字节时刻（兜底计时）
@@ -59,7 +59,7 @@ pub fn TcpFrameParser::new(local_ver : Int, frame_timeout_ms : Int64) -> TcpFram
     mask_buf: [],
     payload_buf: [],
     hdr: None,
-    cur_length: 0,
+    cur_length: 0L,
     violated: false,
     frame_start_ms: 0L,
     drop_last_ms: 0L,
@@ -117,7 +117,7 @@ fn TcpFrameParser::feed_byte(
     StMask => {
       self.mask_buf.push(b)
       if self.mask_buf.length() == 4 {
-        if self.cur_length == 0 {
+        if self.cur_length == 0L {
           self.complete_frame(events)
         } else {
           self.state = StPayload
@@ -126,7 +126,9 @@ fn TcpFrameParser::feed_byte(
     }
     StPayload => {
       self.payload_buf.push(b)
-      if self.payload_buf.length() == self.cur_length {
+      // 实际缓冲区长度是 Int；与 64 位声明长度比较时显式转换（超 Int 上限的
+      // 声明永远收不满，最终由半帧超时/兜底超时终止，不会错位交付）
+      if self.payload_buf.length().to_int64() == self.cur_length {
         self.complete_frame(events)
       }
     }
@@ -170,12 +172,12 @@ fn TcpFrameParser::on_header_complete(self : TcpFrameParser, events : Array[TcpE
 /// Length 字段收齐（TCP 不做 max_payload_len 帧级校验，§4.3 步骤 5）
 fn TcpFrameParser::on_length_complete(self : TcpFrameParser, events : Array[TcpEvent]) -> Unit {
   let v = read_be_i64(@codec.bytes_of_array(self.length_buf), 0, self.length_buf.length())
-  self.cur_length = v.to_int()
+  self.cur_length = v // Length 按 64 位保存（PLB=7 时协议上限 2^56−1，§3.2）
   match self.hdr {
     Some(h) => {
       if h.msk {
         self.state = StMask
-      } else if self.cur_length == 0 {
+      } else if self.cur_length == 0L {
         self.complete_frame(events)
       } else {
         self.state = StPayload
@@ -214,7 +216,7 @@ fn TcpFrameParser::reset_frame(self : TcpFrameParser) -> Unit {
   self.mask_buf.clear()
   self.payload_buf.clear()
   self.hdr = None
-  self.cur_length = 0
+  self.cur_length = 0L
   self.violated = false
 }
 
@@ -252,8 +254,15 @@ pub fn TcpFrameParser::check_timeout(self : TcpFrameParser, now_ms : Int64) -> A
           match self.hdr {
             Some(h) => {
               // 帧总长 L = 8 + Length 字节数 + Key 字节数 + Payload 长度；剩余 R = L − 已收
-              let total = 8 + (if h.plb > 0 { h.plb } else { 0 }) + (if h.msk { 4 } else { 0 }) + self.cur_length
-              let received = 8 + self.length_buf.length() + self.mask_buf.length() + self.payload_buf.length()
+              // 全部按 Int64 计算：声明长度可达 2^56−1，用 Int 会溢出/截断（§3.2）
+              let total = 8L +
+                (if h.plb > 0 { h.plb.to_int64() } else { 0L }) +
+                (if h.msk { 4L } else { 0L }) +
+                self.cur_length
+              let received = 8L +
+                self.length_buf.length().to_int64() +
+                self.mask_buf.length().to_int64() +
+                self.payload_buf.length().to_int64()
               let r = total - received
               self.drop_last_ms = now_ms
               if r <= 0 {

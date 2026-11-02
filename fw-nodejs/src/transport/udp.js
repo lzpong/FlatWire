@@ -15,10 +15,16 @@ import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { parseDatagram, encodeFrame } from '../frame/frame.js';
 
-// 组播操作码集合：UDP 上这些 Code 的解析违规视为组播帧 → 静默丢弃
-// （平台限制：dgram 无法获知数据报目的地址，以操作码启发式区分组播/单播，
-//   见模块头与 README "有意偏差"）
-const MULTICAST_LIKE_CODES = new Set([0x01, 0x02]); // SD Offer / SD Find
+// 组播候选判定（平台限制：dgram 无法获知数据报目的地址，以帧头启发式区分）
+// 只有控制帧范围内的 Offer / Find / REN 才可能是组播；数据帧（CTR=0）一律
+// 按单播处理，否则 Request/FF 的解析违规会被错误静默（§1.2/§4.3）。
+export function isMulticastLike(buf) {
+  if (buf.length < 2) return false;
+  if ((buf[0] & 0x80) === 0) return false; // CTR=0 → 数据帧，必为单播
+  const code = buf[1] & 0x3f;
+  if (code === 0x01 || code === 0x02) return true; // SD Offer / SD Find
+  return (buf[0] & 0x40) !== 0 && code === 0x00;   // REN（CTR=1、REN=1、Code=0）
+}
 
 // 收集本机 IPv4 地址集合（自我回环过滤用）
 function localIpv4Set() {
@@ -124,8 +130,8 @@ export class UdpTransport extends EventEmitter {
     // 自我回环过滤：源 IP 是本机地址且源端口等于本 socket 端口 → 本 socket 发出的组播回环帧
     if (this._localAddrs.has(rinfo.address) && rinfo.port === sock.address().port) return;
 
-    // 组播操作码启发式：Offer/Find 的解析违规按组播帧静默丢弃
-    const multicastLike = buf.length >= 2 && ((buf[1] & 0x3f) === 0x01 || (buf[1] & 0x3f) === 0x02);
+    // 组播启发式：仅 Offer/Find/REN 的解析违规按组播帧静默丢弃
+    const multicastLike = isMulticastLike(buf);
     const res = parseDatagram(buf, {
       ver: this.ver,
       maxPayloadLen: this.maxPayloadLen,

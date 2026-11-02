@@ -19,8 +19,8 @@
 |---|------|------|------|
 | 1.1 | 帧头往返 | 全字段组合（CTR/REN/VER/MSK/PLB/TYP/Code/SvcID/IfID/InstID/StrmID） | 解码后字段值一致 |
 | 1.2 | VER 不等拒绝 | VER ≠ 本端 | 组播静默丢弃；单播回 RST(0x22) |
-| 1.3 | PLB 边界 | PLB=0 / PLB=7 | PLB=0 无 Length 字段；PLB=7 支持最大 Length |
-| 1.4 | Payload Length 编码 | 0 / 1 / 255 / 65535 / 2^56-1 | 0→PLB=0；超大值→PLB=7 |
+| 1.3 | PLB 边界 | PLB=0 / PLB=7 | PLB=0 无 Length 字段；PLB=7 支持最大 Length（64 位语义，解析端不得截断为 32 位） |
+| 1.4 | Payload Length 编码 | 0 / 1 / 255 / 65535 / 2^56-1 | 0→PLB=0；超大值→PLB=7；解析回读 `payload_len`/`expected_total` 必须与声明值一致 |
 | 1.5 | **IDL 变长字段强制声明** | string/bytes/array 既无 `fixed_len` 也无 `max_len` | **IDL 加载失败**（该定义被拒绝，其他定义不受影响） |
 | 1.6 | Bool 严格解码 | `0x00` / `0x01` / `0x02` | `0x00`→false、`0x01`→true；`0x02` 抛 `InvalidBoolEncoding` |
 | 1.7 | Signed 边界（裸字节） | i8 -128/0/127；i64 值 10 | 1B/8B 大端补码正确；**值 10 仍占满 8B**（恒定宽度，不压缩） |

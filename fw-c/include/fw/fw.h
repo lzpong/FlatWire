@@ -194,10 +194,14 @@ typedef struct {
   uint16_t svc_id, if_id;
   uint8_t  inst_id, strm_id;
   const uint8_t *payload;   // 已按 MSK 还原的数据
+  // 交付层实际承载上限 2^32−1（实现承载上限，§3.2）：声明长度超限的帧不入此结构，
+  // 由解析器显式丢弃并记日志，绝不截断成小值交付
   uint32_t payload_len;
 } fw_frame_t;
 
 // 帧编码描述（encodeFrame 输入）
+// 注意：编码侧受宿主缓冲地址空间约束，payload_len 实际上限 2^32−1；
+// 解码侧 Length 字段仍按 64 位语义解析（见 fw_head_res_t）
 typedef struct {
   uint8_t  ctr, ren, ver, msk, typ, code;
   uint16_t svc_id, if_id;
@@ -237,8 +241,10 @@ typedef struct {
   uint16_t svc_id, if_id;
   uint8_t  inst_id, strm_id;
   uint32_t header_len;      // 8 + plb + (msk?4:0)
-  uint32_t payload_len;
-  uint32_t expected_total;  // header_len + payload_len
+  // §3.2：Length 为 64 位语义（PLB=7 时协议上限 2^56−1）。
+  // 必须完整保留声明长度参与帧边界计算，禁止截断为 32 位（否则会错位定界）。
+  uint64_t payload_len;
+  uint64_t expected_total;  // header_len + payload_len（64 位，无溢出风险）
   const uint8_t *mask_key;  // msk=1 时指向 buf 内 4B
   // INVALID 时有效：待回 RST 的回显字段（§5.4）
   uint8_t  rst_ctr;
@@ -273,9 +279,9 @@ struct fw_stream_parser {
   int      receiving;        // 有帧正在接收（帧首字节已到达且未交付）
   int      header_done;      // 当前帧帧头已收齐（≥8B 含 Length/Mask）
   fw_head_res_t head;        // 当前帧头信息（header_done 时有效）
-  uint32_t received;         // 当前帧已收总字节
+  uint64_t received;         // 当前帧已收总字节（64 位，与 expected_total 同宽）
   int      drop_mode;        // 丢弃模式（§4.1 阶段二）
-  uint32_t drop_remaining;   // 剩余待丢弃字节 R = L − 已收
+  uint64_t drop_remaining;   // 剩余待丢弃字节 R = L − 已收（可远超 2^32）
   int64_t  drop_last_ms;     // 丢弃模式每收字节刷新计时（兜底超时判定）
   uint8_t *scratch;          // 交付暂存（粘包下 on_frame 回调前解析缓冲会被
   size_t   scratch_cap;      //   memmove 挪动，payload 须拷贝解耦后再消费）
@@ -292,9 +298,10 @@ void fw_sp_free(fw_stream_parser_t *p);
 int  fw_sp_feed(fw_stream_parser_t *p, const uint8_t *chunk, size_t n);
 int  fw_sp_receiving(const fw_stream_parser_t *p);   // receiving || drop_mode
 int  fw_sp_header_complete(const fw_stream_parser_t *p);
-void fw_sp_frame_info(const fw_stream_parser_t *p, uint32_t *total, uint32_t *recv);
+// 当前帧声明总长与已收字节（64 位，§3.2 Length 语义）
+void fw_sp_frame_info(const fw_stream_parser_t *p, uint64_t *total, uint64_t *recv);
 // 进入丢弃模式（帧头完整、Payload 不完整；§4.1 阶段二），返回剩余丢弃字节数
-uint32_t fw_sp_enter_drop_mode(fw_stream_parser_t *p, int64_t now_ms);
+uint64_t fw_sp_enter_drop_mode(fw_stream_parser_t *p, int64_t now_ms);
 
 // ============================================================
 // CRC-16/CCITT-FALSE（§9.6 唯一变体）

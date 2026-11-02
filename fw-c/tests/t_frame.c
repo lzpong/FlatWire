@@ -72,6 +72,30 @@ int suite_frame(void) {
   CHECK_EQ_INT(fw_frame_encode(buf, sizeof(buf), &d0), 8);
   TEST_END();
 
+  TEST_BEGIN("§3.2 Length 64 位语义：PLB=7 声明长度不被 32 位截断");
+  {
+    // 手工构造数据帧头（PLB=7）：声明 Payload = 2^40（远超 32 位），验证
+    // payload_len / expected_total 原样保留；截断会使帧边界错位（回归防护）。
+    fw_parse_opts_t o;
+    opts(&o, 0); // TCP 语义：UDP 会先被 max_payload_len 拒绝
+    const uint64_t cases[2] = { (uint64_t)1 << 40, (((uint64_t)1 << 56) - 1) };
+    for (int k = 0; k < 2; k++) {
+      uint8_t hb[15];
+      memset(hb, 0, sizeof(hb));
+      hb[0] = 0x07; // CTR=0 REN=0 VER=0 MSK=0 PLB=7
+      hb[1] = (uint8_t)((FW_TYP_NON << 6) | FW_CODE_REQUEST);
+      hb[2] = 0; hb[3] = 1; hb[4] = 0; hb[5] = 1; hb[6] = 1; hb[7] = 1;
+      for (int i = 0; i < 7; i++)
+        hb[8 + i] = (uint8_t)((cases[k] >> (8 * (6 - i))) & 0xFF);
+      fw_head_res_t h;
+      CHECK(fw_parse_header(hb, sizeof(hb), 0, &o, &h) == FW_PARSE_OK);
+      CHECK_EQ_INT(h.plb, 7);
+      CHECK_EQ_U64(h.payload_len, cases[k]);
+      CHECK_EQ_U64(h.expected_total, (uint64_t)15 + cases[k]); // 8B 帧头 + 7B Length
+    }
+  }
+  TEST_END();
+
   TEST_BEGIN("2.6/2.7/2.8 UDP 长度不符/过短/超限");
   fw_parse_opts_t o;
   opts(&o, 1);
@@ -185,6 +209,48 @@ int suite_frame(void) {
   CHECK_EQ_INT(fw_parse_datagram(x2, 8, &o, &fr, &rst), FW_PARSE_OK);
   uint8_t x3[] = {0x80, 0xE4, 0, 0, 0, 0, 0, 0}; // RST Code=0x24 合法
   CHECK_EQ_INT(fw_parse_datagram(x3, 8, &o, &fr, &rst), FW_PARSE_OK);
+  // §4.3 方案 A：TYP=RST 豁免步骤 3/4 → 任意/越界 ID 仍解析成功
+  uint8_t x4[] = {0x80, 0xE4, 0x12, 0x34, 0x56, 0x78, 0xAB, 0xFE}; // RST Code=0x24
+  CHECK_EQ_INT(fw_parse_datagram(x4, 8, &o, &fr, &rst), FW_PARSE_OK);
+  CHECK_EQ_INT(fr.svc_id, 0x1234);
+  CHECK_EQ_INT(fr.if_id, 0x5678);
+  CHECK_EQ_INT(fr.inst_id, 0xAB);
+  CHECK_EQ_INT(fr.strm_id, 0xFE);
+  // 仅豁免 ID：形态校验仍生效（RST 带 Payload，PLB=1 → RST(0x00)）
+  uint8_t x5[] = {0x81, 0xE4, 0x12, 0x34, 0x56, 0x78, 0xAB, 0xFE, 0x00};
+  CHECK_EQ_INT(fw_parse_datagram(x5, 9, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
+  // §4.3 方案 A 扩展：数据帧 RST（CTR=0）同样豁免步骤 3/4
+  // SvcID=0/IfID=0（数据帧非法）、InstID=0、StrmID=0xFF（保留值）→ 仍解析成功
+  uint8_t x6[] = {0x00, 0xE4, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF};
+  CHECK_EQ_INT(fw_parse_datagram(x6, 8, &o, &fr, &rst), FW_PARSE_OK);
+  CHECK_EQ_INT(fr.ctr, 0);
+  CHECK_EQ_INT(fr.svc_id, 0);
+  CHECK_EQ_INT(fr.if_id, 0);
+  CHECK_EQ_INT(fr.inst_id, 0);
+  CHECK_EQ_INT(fr.strm_id, 0xFF);
+  // 步骤 2 约束仍生效：数据帧 RST Code=0x01 非法 → RST(0x00)
+  uint8_t x7[] = {0x00, 0xC1, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF};
+  CHECK_EQ_INT(fw_parse_datagram(x7, 8, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
+  // 步骤 2 约束仍生效：数据帧 RST PLB>0 → RST(0x00)
+  uint8_t x8[] = {0x01, 0xE4, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
+  CHECK_EQ_INT(fw_parse_datagram(x8, 9, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
+  // §4.3/§5.4：数据帧 ACK 不豁免步骤 3/4（严格口径）
+  // SvcID=0 / IfID=0 / StrmID=0xFF → 步骤 3/4 违规，回 RST(0x00)
+  uint8_t x9[] = {0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF};
+  CHECK_EQ_INT(fw_parse_datagram(x9, 8, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
+  // 仅 StrmID 越界（其余 ID 合法）：步骤 4 单独命中 → RST(0x00)
+  uint8_t x11[] = {0x00, 0x80, 0x00, 0x01, 0x00, 0x02, 0x03, 0xFF};
+  CHECK_EQ_INT(fw_parse_datagram(x11, 8, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
+  // 合法数据帧 ACK（ID 全在合法范围）正常解析
+  uint8_t x10[] = {0x00, 0x80, 0x00, 0x01, 0x00, 0x02, 0x03, 0xFE};
+  CHECK_EQ_INT(fw_parse_datagram(x10, 8, &o, &fr, &rst), FW_PARSE_OK);
+  CHECK_EQ_INT(fr.typ, FW_TYP_ACK);
+  CHECK_EQ_INT(fr.strm_id, 0xFE);
   TEST_END();
 
   TEST_BEGIN("2.21 TCP 收 CON/ACK → RST(0x00) + 2.29 控制帧 MSK=1");

@@ -450,7 +450,12 @@ static int decode_value(const fw_tdesc_t *t, const uint8_t *buf, size_t len, siz
         if (r != FW_OK) return r;
         if (n > (uint64_t)t->max_len) return FW_DEC_MAXLEN; // §9.3 解码上限校验
       }
-      fw_value_t *arr = fw_value_array(n ? (uint32_t)n : 1);
+      // 预分配上限取"声明元素数"与"剩余字节数"的较小值：每个元素至少消费
+      // 1 字节（空结构体除外），据此可避免 n=max_len（可达 2^31）时先分配
+      // 巨量内存再因字节不足失败的放大攻击；push 会在元素确实消费字节时扩容。
+      uint64_t remain = (uint64_t)(len - *pos);
+      uint32_t cap = n < remain ? (uint32_t)n : (uint32_t)(remain ? remain : 1);
+      fw_value_t *arr = fw_value_array(cap);
       if (!arr) return FW_ERR_MEMORY;
       for (uint64_t i = 0; i < n; i++) {
         fw_value_t *el = NULL;
@@ -485,37 +490,46 @@ static int decode_value(const fw_tdesc_t *t, const uint8_t *buf, size_t len, siz
 // 接口级 payload 编解码（§13 payload 语义 + §2 max_payload + §9.6 CRC）
 // ============================================================
 
-// 解析接口方向类型名列表 → 规范化类型数组；失败返回 -1
-static int iface_types(fw_schema_t *s, const fw_iface_t *iface, int direction,
-                       const fw_tdesc_t **types, int max, char *err, int errsz) {
+// 解析接口方向类型名列表 → 动态分配规范化类型数组（调用方负责 free）；
+// 失败返回 NULL 并填写 err。取消原先固定 16 槽上限，避免多参数接口被静默截断。
+static const fw_tdesc_t **iface_types(fw_schema_t *s, const fw_iface_t *iface, int direction,
+                                      int *out_n, char *err, int errsz) {
+  int need = direction == 0 ? iface->input_n : (iface->output_name ? 1 : 0);
+  const fw_tdesc_t **types =
+      (const fw_tdesc_t **)calloc((size_t)(need ? need : 1), sizeof(*types));
+  if (!types) {
+    if (err && errsz > 0) snprintf(err, (size_t)errsz, "out of memory");
+    return NULL;
+  }
   int n = 0;
   if (direction == 0) {
-    for (int i = 0; i < iface->input_n && n < max; i++) {
+    for (int i = 0; i < iface->input_n; i++) {
       types[n] = fw_schema_resolve(s, iface->input_names[i]);
       if (!types[n]) {
         if (err && errsz > 0) snprintf(err, (size_t)errsz, "type \"%s\" not defined in IDL", iface->input_names[i]);
-        return -1;
+        free(types);
+        return NULL;
       }
       n++;
     }
-  } else {
-    if (iface->output_name && n < max) {
-      types[0] = fw_schema_resolve(s, iface->output_name);
-      if (!types[0]) {
-        if (err && errsz > 0) snprintf(err, (size_t)errsz, "type \"%s\" not defined in IDL", iface->output_name);
-        return -1;
-      }
-      n = 1;
+  } else if (iface->output_name) {
+    types[0] = fw_schema_resolve(s, iface->output_name);
+    if (!types[0]) {
+      if (err && errsz > 0) snprintf(err, (size_t)errsz, "type \"%s\" not defined in IDL", iface->output_name);
+      free(types);
+      return NULL;
     }
+    n = 1;
   }
-  return n;
+  *out_n = n;
+  return types;
 }
 
 int fw_encode_payload(const fw_schema_t *s, const fw_iface_t *iface, int direction,
                       const fw_value_t *payload, fw_buf_t *out, char *err, int errsz) {
-  const fw_tdesc_t *types[16];
-  int n = iface_types((fw_schema_t *)s, iface, direction, types, 16, err, errsz);
-  if (n < 0) return FW_ERR_PARAM;
+  int n = 0;
+  const fw_tdesc_t **types = iface_types((fw_schema_t *)s, iface, direction, &n, err, errsz);
+  if (!types) return FW_ERR_PARAM;
 
   int r = FW_OK;
   if (n == 0) {
@@ -524,11 +538,14 @@ int fw_encode_payload(const fw_schema_t *s, const fw_iface_t *iface, int directi
     r = encode_value(types[0], payload, out, 0);
   } else {
     // 多参数：payload 必须为 ARRAY 且逐位置对应
-    if (!payload || payload->type != FW_V_ARRAY || payload->as.arr.len != (uint32_t)n)
+    if (!payload || payload->type != FW_V_ARRAY || payload->as.arr.len != (uint32_t)n) {
+      free(types);
       return FW_ERR_PARAM;
+    }
     for (int i = 0; i < n && r == FW_OK; i++)
       r = encode_value(types[i], payload->as.arr.items[i], out, 0);
   }
+  free(types);
   if (r != FW_OK) return r;
 
   // §9.6：接口声明 "crc": true 才在字段序列末尾附加 2B CRC-16/CCITT-FALSE（大端）
@@ -545,35 +562,38 @@ int fw_encode_payload(const fw_schema_t *s, const fw_iface_t *iface, int directi
 
 int fw_decode_payload(const fw_schema_t *s, const fw_iface_t *iface, int direction,
                       const uint8_t *buf, uint32_t len, fw_value_t **out, char *err, int errsz) {
-  const fw_tdesc_t *types[16];
-  int n = iface_types((fw_schema_t *)s, (fw_iface_t *)iface, direction, types, 16, err, errsz);
-  if (n < 0) return FW_ERR_PARAM;
+  int n = 0;
+  const fw_tdesc_t **types = iface_types((fw_schema_t *)s, (fw_iface_t *)iface, direction, &n, err, errsz);
+  if (!types) return FW_ERR_PARAM;
   *out = NULL;
 
   // §9.6 接收顺序：CRC 校验（先于字段解码）→ 剥离 → 契约字段解码
   if (iface->crc) {
-    if (len < 2) return FW_DEC_CRC;
+    if (len < 2) { free(types); return FW_DEC_CRC; }
     uint16_t expect = (uint16_t)(((uint16_t)buf[len - 2] << 8) | buf[len - 1]);
-    if (fw_crc16(buf, len - 2) != expect) return FW_DEC_CRC;
+    if (fw_crc16(buf, len - 2) != expect) { free(types); return FW_DEC_CRC; }
     len -= 2; // 剥离 CRC：解码器看到的 Data 不含 CRC
   }
 
   size_t pos = 0;
-  if (n == 0) return FW_OK; // 无类型：*out = NULL
+  if (n == 0) { free(types); return FW_OK; } // 无类型：*out = NULL
   if (n == 1) {
     // schema 字段耗尽后剩余字节忽略（§9.1 末尾新增字段兼容）
-    return decode_value(types[0], buf, len, &pos, out, 0);
+    int r = decode_value(types[0], buf, len, &pos, out, 0);
+    free(types);
+    return r;
   }
 
   // 多参数：逐类型解码为值数组
   fw_value_t *arr = fw_value_array((uint32_t)n);
-  if (!arr) return FW_ERR_MEMORY;
+  if (!arr) { free(types); return FW_ERR_MEMORY; }
   for (int i = 0; i < n; i++) {
     fw_value_t *v = NULL;
     int r = decode_value(types[i], buf, len, &pos, &v, 0);
-    if (r != FW_OK) { fw_value_free(v); fw_value_free(arr); return r; }
-    if (fw_array_push(arr, v) != FW_OK) { fw_value_free(v); fw_value_free(arr); return FW_ERR_MEMORY; }
+    if (r != FW_OK) { fw_value_free(v); fw_value_free(arr); free(types); return r; }
+    if (fw_array_push(arr, v) != FW_OK) { fw_value_free(v); fw_value_free(arr); free(types); return FW_ERR_MEMORY; }
   }
+  free(types);
   *out = arr;
   return FW_OK;
 }

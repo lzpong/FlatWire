@@ -42,11 +42,21 @@ export class Schema {
     if (!svc || typeof svc !== 'object' || typeof svc.svc_id !== 'number') {
       throw new InvalidArgument('IDL missing service.svc_id');
     }
+    // §11.1：SvcID 为 1~0xFFFF；0 保留（数据帧 SvcID=0 属协议违规）
+    if (!Number.isInteger(svc.svc_id) || svc.svc_id < 1 || svc.svc_id > 0xffff) {
+      throw new InvalidArgument(`IDL service.svc_id must be 1..65535, got ${svc.svc_id}`);
+    }
+    const majorVer = svc.major_ver ?? 0;
+    const minorVer = svc.minor_ver ?? 0;
+    if (!Number.isInteger(majorVer) || majorVer < 0 || majorVer > 0xff ||
+        !Number.isInteger(minorVer) || minorVer < 0 || minorVer > 0xff) {
+      throw new InvalidArgument('IDL service.major_ver/minor_ver must be 0..255');
+    }
 
     this.raw = idl;
     this.svcId = svc.svc_id;
-    this.majorVer = svc.major_ver;
-    this.minorVer = svc.minor_ver ?? 0;
+    this.majorVer = majorVer;
+    this.minorVer = minorVer;
     this.serviceName = svc.name ?? '';
 
     // 类型定义（三处位置：structs / arrays / enums，§11.1）
@@ -59,8 +69,16 @@ export class Schema {
     for (const iface of svc.interfaces ?? []) {
       if (!iface || typeof iface !== 'object') throw new InvalidArgument('IDL interface must be an object');
       if (typeof iface.if_id !== 'number') throw new InvalidArgument(`IDL interface "${iface.name}" missing if_id`);
+      // §11.1：IfID 为 1~0xFFFF；0 保留（ID=0 通配仅 SD Entry 场景）
+      if (!Number.isInteger(iface.if_id) || iface.if_id < 1 || iface.if_id > 0xffff) {
+        throw new InvalidArgument(`IDL interface "${iface.name}" if_id must be 1..65535`);
+      }
       if (!['rpc', 'ff', 'event'].includes(iface.type)) {
         throw new InvalidArgument(`IDL interface "${iface.name}" has invalid type "${iface.type}"`);
+      }
+      // §2：transport 仅允许 tcp/udp（省略时按 type 默认绑定）
+      if (iface.transport !== undefined && iface.transport !== 'tcp' && iface.transport !== 'udp') {
+        throw new InvalidArgument(`IDL interface "${iface.name}" transport must be tcp/udp`);
       }
       if (iface.crc !== undefined && typeof iface.crc !== 'boolean') {
         throw new InvalidArgument(`IDL interface "${iface.name}" crc must be boolean`);
@@ -78,6 +96,12 @@ export class Schema {
         push_policy: iface.push_policy ?? null,
       };
       if (!Array.isArray(def.input)) throw new InvalidArgument(`interface "${iface.name}" input must be array`);
+      if (def.input.some((t) => typeof t !== 'string')) {
+        throw new InvalidArgument(`interface "${iface.name}" input must contain type-name strings`);
+      }
+      if (def.output !== null && typeof def.output !== 'string') {
+        throw new InvalidArgument(`interface "${iface.name}" output must be a type-name string`);
+      }
       this.interfaces.set(iface.if_id, def);
     }
 

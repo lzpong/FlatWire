@@ -28,7 +28,7 @@ pub extend IfKind with @moonbitlang/core/debug.Debug::{to_repr}
 /// 接口定义（§11.1 字段说明）
 pub(all) struct IdlInterface {
   name : String
-  if_id : Int // 1~0x7FFF=rpc/ff、0x8000~0xFFFF=event（§11.1）
+  if_id : Int // 1~0xFFFF；建议（SHOULD）1~0x7FFF=rpc/ff、0x8000~0xFFFF=event，落另一区间不拒绝（§11.1）
   kind : IfKind
   tcp : Bool // transport 绑定（省略时 rpc/ff=tcp、event=udp，§11.1）
   max_payload : Int // 接口级 Payload 上限（0=未声明；TCP/UDP 均适用，§11.1）

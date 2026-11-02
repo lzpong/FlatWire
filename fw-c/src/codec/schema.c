@@ -381,8 +381,8 @@ static int build_enum_def(fw_typedef_t *d, const fw_value_t *je, const char *ena
     snprintf(err, (size_t)errsz, "enum \"%s\": use base instead of type", ename);
     return 0;
   }
-  if (jhas(je, "size")) {
-    snprintf(err, (size_t)errsz, "enum \"%s\": size is not supported in v5 (use base)", ename);
+  if (jhas(je, "size") || jhas(je, "width")) {
+    snprintf(err, (size_t)errsz, "enum \"%s\": size/width are not supported in v5 (use base)", ename);
     return 0;
   }
   const char *base = jstr(je, "base", "u8");
@@ -466,8 +466,12 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
   int64_t svc_id = jint(svc, "svc_id", 0);
   if (svc_id <= 0 || svc_id > 0xFFFF) FAIL("IDL missing/invalid service.svc_id");
   s->svc_id = (uint16_t)svc_id;
-  s->major_ver = (uint8_t)jint(svc, "major_ver", 0);
-  s->minor_ver = (uint8_t)jint(svc, "minor_ver", 0);
+  int64_t major = jint(svc, "major_ver", 0);
+  int64_t minor = jint(svc, "minor_ver", 0);
+  if (major < 0 || major > 0xFF || minor < 0 || minor > 0xFF)
+    FAIL("service.major_ver/minor_ver must be 0..255");
+  s->major_ver = (uint8_t)major;
+  s->minor_ver = (uint8_t)minor;
   snprintf(s->name, sizeof(s->name), "%s", jstr(svc, "name", ""));
 
   // ---- interfaces（transport 省略按类型默认：rpc/ff=tcp，event=udp，§11.1） ----
@@ -481,28 +485,44 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
       const fw_value_t *ji = ifaces->as.arr.items[i];
       fw_iface_t *d = &s->ifaces[i];
       snprintf(d->name, sizeof(d->name), "%s", jstr(ji, "name", "?"));
-      d->if_id = (uint16_t)jint(ji, "if_id", 0);
+      int64_t if_id = jint(ji, "if_id", 0);
+      if (if_id <= 0 || if_id > 0xFFFF) FAIL("interface.if_id must be 1..65535");
+      d->if_id = (uint16_t)if_id;
       const char *ty = jstr(ji, "type", "rpc");
+      // §11.1：type 仅允许 rpc/ff/event，未知值不得静默按 rpc 处理
+      if (strcmp(ty, "rpc") != 0 && strcmp(ty, "ff") != 0 && strcmp(ty, "event") != 0)
+        FAIL("interface.type must be rpc/ff/event");
       d->type = strcmp(ty, "event") == 0 ? FW_IF_EVENT : (strcmp(ty, "ff") == 0 ? FW_IF_FF : FW_IF_RPC);
       const char *tr = jstr(ji, "transport", NULL);
+      // §2/§11.1：transport 仅允许 tcp/udp
+      if (tr && strcmp(tr, "tcp") != 0 && strcmp(tr, "udp") != 0)
+        FAIL("interface.transport must be tcp/udp");
       if (tr) d->transport = (strcmp(tr, "udp") == 0) ? FW_TR_UDP : FW_TR_TCP;
       else d->transport = (d->type == FW_IF_EVENT) ? FW_TR_UDP : FW_TR_TCP; // §11.1 默认绑定
       d->reliable = jbool(ji, "reliable", 0);
       d->max_payload = (int32_t)jint(ji, "max_payload", -1);
+      // §9.6：crc 若声明必须是布尔值（缺省关闭）
+      if (jhas(ji, "crc")) {
+        const fw_value_t *cv = fw_struct_get(ji, "crc");
+        if (!cv || cv->type != FW_V_BOOL) FAIL("interface.crc must be boolean");
+      }
       d->crc = jbool(ji, "crc", 0); // 缺省关闭：仅 "crc": true 时附加 2B CRC（§9.6）
       // input：类型名数组
       const fw_value_t *in = fw_struct_get(ji, "input");
+      if (in && in->type != FW_V_ARRAY) FAIL("interface.input must be an array");
       if (in && in->type == FW_V_ARRAY && in->as.arr.len > 0) {
         d->input_n = (int)in->as.arr.len;
         d->input_names = (char **)calloc((size_t)d->input_n, sizeof(char *));
         if (!d->input_names) FAIL("out of memory");
         for (int k = 0; k < d->input_n; k++) {
           const fw_value_t *e = in->as.arr.items[k];
-          d->input_names[k] = FW_STRDUP(e && e->type == FW_V_STRING ? e->as.s.ptr : "");
+          if (!e || e->type != FW_V_STRING) FAIL("interface.input must contain type-name strings");
+          d->input_names[k] = FW_STRDUP(e->as.s.ptr);
           if (!d->input_names[k]) FAIL("out of memory");
         }
       }
       const fw_value_t *outv = fw_struct_get(ji, "output");
+      if (outv && outv->type != FW_V_STRING) FAIL("interface.output must be a type-name string");
       if (outv && outv->type == FW_V_STRING) {
         d->output_name = FW_STRDUP(outv->as.s.ptr);
         if (!d->output_name) FAIL("out of memory");

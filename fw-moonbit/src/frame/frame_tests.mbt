@@ -262,6 +262,71 @@ test "rst code validation (2.20)" {
   }
 }
 
+/// §4.3 方案 A：TYP=RST 豁免步骤 3/4，任意/越界 ID 仍解析成功
+test "control rst with arbitrary ids parses ok (A)" {
+  let raw = encode_frame(spec(true, false, Rst, 0x24, 0x1234, 0x5678, 0xAB, 0xFE), b"", None)
+  match parse_udp(raw) {
+    Ok(f) => {
+      assert_eq(f.svc_id, 0x1234)
+      assert_eq(f.if_id, 0x5678)
+      assert_eq(f.inst_id, 0xAB)
+      assert_eq(f.strm_id, 0xFE)
+    }
+    Reject(code, _) => fail("A: expect Ok, got Reject(\{code})")
+    _ => fail("A: expect Ok")
+  }
+}
+
+/// §4.3 方案 A 扩展：数据帧 RST（CTR=0）同样豁免步骤 3/4，非法/越界 ID 仍解析成功
+test "data-frame rst with illegal ids parses ok (A)" {
+  // SvcID=0/IfID=0（数据帧非法）、InstID=0、StrmID=0xFF（保留值）→ 仍解析成功
+  let raw = encode_frame(spec(false, false, Rst, 0x24, 0, 0, 0, 0xFF), b"", None)
+  match parse_udp(raw) {
+    Ok(f) => {
+      assert_eq(f.ctr, false)
+      assert_eq(f.svc_id, 0)
+      assert_eq(f.if_id, 0)
+      assert_eq(f.inst_id, 0)
+      assert_eq(f.strm_id, 0xFF)
+    }
+    Reject(code, _) => fail("data-frame RST: expect Ok, got Reject(\{code})")
+    _ => fail("data-frame RST: expect Ok")
+  }
+  // 步骤 2 约束仍生效：数据帧 RST Code=0x01 非法 → Reject(0x00)
+  match parse_udp(encode_frame(spec(false, false, Rst, 0x01, 0, 0, 0, 0xFF), b"", None)) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("data-frame RST code: expect Reject(0x00)")
+  }
+  // 步骤 2 约束仍生效：数据帧 RST PLB>0 → Reject(0x00)
+  match parse_udp(encode_frame(spec(false, false, Rst, 0x24, 0, 0, 0, 0xFF), b"\x00", None)) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("data-frame RST plb: expect Reject(0x00)")
+  }
+}
+
+/// §4.3/§5.4：数据帧 ACK 不豁免步骤 3/4（严格口径），非法回显 ID → Reject(0x00)
+test "data-frame ack illegal ids rejected (strict ack)" {
+  // SvcID=0 / IfID=0 / StrmID=0xFF：数据帧 ID 越界，ACK 不豁免 → 步骤 3/4 违规
+  match parse_udp(encode_frame(spec(false, false, Ack, 0x00, 0, 0, 1, 0xFF), b"", None)) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("data-frame ACK illegal ids: expect Reject(0x00)")
+  }
+  // 仅 StrmID 越界（其余 ID 合法）：步骤 4 单独命中 → Reject(0x00)
+  match parse_udp(encode_frame(spec(false, false, Ack, 0x00, 1, 2, 3, 0xFF), b"", None)) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("data-frame ACK illegal strm: expect Reject(0x00)")
+  }
+  // 合法数据帧 ACK（SvcID≠0 / IfID≠0 / InstID≠0 / StrmID∈0x01~0xFE）正常解析
+  match parse_udp(encode_frame(spec(false, false, Ack, 0x00, 1, 2, 3, 0xFE), b"", None)) {
+    Ok(f) => {
+      assert_eq(f.typ, Ack)
+      assert_eq(f.strm_id, 0xFE)
+    }
+    Reject(code, _) => fail("legal data-frame ACK: expect Ok, got Reject(\{code})")
+    _ => fail("legal data-frame ACK: expect Ok")
+  }
+}
+
 /// TCP 收 CON/ACK 违规（测试 2.21：TCP 不使用 CON/ACK）
 test "tcp con/ack rejected (2.21)" {
   let raw = df(Con, 0x01, 1, 1, 1, 1)
@@ -409,6 +474,38 @@ test "tcp half-frame stage2 drop mode (2.22)" {
   let ev2 = p.feed(nf, 7100L)
   assert_eq(ev2.length(), 1)
   assert_eq(expect_frame(ev2[0]).strm_id, 2)
+}
+
+/// §3.2 Length 64 位语义：PLB=7 声明 2^40 长度时，阶段二必须按 Int64 计算 R
+test "huge declared length stays in drop mode (§3.2)" {
+  let p = TcpFrameParser::new(0, 5000L)
+  // 复用 df() 的 8B 数据帧头，改写 byte0 的 PLB 为 7，并追加 7B Length
+  let base = df(Non, 0x01, 1, 1, 1, 1)
+  let hb : Array[Byte] = []
+  for i in 0..<8 {
+    hb.push(base[i])
+  }
+  hb[0] = b'\x07' // CTR=0 REN=0 VER=0 MSK=0 PLB=7
+  // Length = 2^40 = 0x00 00 01 00 00 00 00（大端 7B）
+  hb.push(b'\x00')
+  hb.push(b'\x00')
+  hb.push(b'\x01')
+  hb.push(b'\x00')
+  hb.push(b'\x00')
+  hb.push(b'\x00')
+  hb.push(b'\x00')
+  let _ = p.feed(@codec.bytes_of_array(hb), 1000L)
+  // 帧头完整 → 阶段二：仅 RST(0x26)，不关连接
+  let events = p.check_timeout(6500L)
+  assert_eq(events.length(), 1)
+  assert_eq(events[0], TcpRst26)
+  // R 为 2^40（若被 Int 截断则 R 可能 ≤0，会误退回 Idle 并直接关连接/误解析后续字节）
+  // 兜底超时前（2×timeout 内）不得关闭
+  assert_eq(p.check_timeout(16000L).length(), 0)
+  // 达到 2×tcp_frame_timeout_ms 无任意字节 → 关连接
+  let events2 = p.check_timeout(16500L)
+  assert_eq(events2.length(), 1)
+  assert_eq(events2[0], TcpClose)
 }
 
 /// 丢弃模式——每字节刷新兜底计时（测试 2.24）

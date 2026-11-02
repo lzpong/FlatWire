@@ -6,6 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { TYP, CODE, encodeFrame, parseHeader, parseDatagram, TcpStreamParser, calcPlb, makeRst } from '../src/frame/frame.js';
 import { RST_CODE } from '../src/errors.js';
+import { StrmManager } from '../src/strm.js';
+import { isMulticastLike } from '../src/transport/udp.js';
 
 const UDP_OPT = { ver: 0, maxPayloadLen: 1400, isUdp: true };
 
@@ -172,6 +174,57 @@ test('2.20 RST Code=0x01（非错误码）→ RST(0x00)', () => {
   assert.equal(parseDatagram(ok, UDP_OPT).ok, true);
 });
 
+// ---- §4.3 方案 A：TYP=RST 豁免步骤 3/4 的 ID 校验 ----
+test('§4.3 TYP=RST 携带任意/越界 ID 仍解析成功', () => {
+  // CTR=1、TYP=RST、Code=0x24：SvcID/IfID/InstID 非 0、StrmID=0xFE（数据帧回显值）
+  const buf = Buffer.from([0x80, (TYP.RST << 6) | 0x24, 0x12, 0x34, 0x56, 0x78, 0xab, 0xfe]);
+  const r = parseDatagram(buf, UDP_OPT);
+  assert.equal(r.ok, true);
+  assert.equal(r.frame.svc_id, 0x1234);
+  assert.equal(r.frame.if_id, 0x5678);
+  assert.equal(r.frame.inst_id, 0xab);
+  assert.equal(r.frame.strm_id, 0xfe);
+  // 仅豁免 ID：形态校验仍生效（RST 带 Payload，PLB=1 → RST(0x00)）
+  const bad = Buffer.from([0x81, (TYP.RST << 6) | 0x24, 0x12, 0x34, 0x56, 0x78, 0xab, 0xfe, 0x00]);
+  assert.equal(parseDatagram(bad, UDP_OPT).rst.code, 0x00);
+});
+
+// ---- §4.3 方案 A 扩展：数据帧 RST（CTR=0）同样豁免步骤 3/4 ----
+test('§4.3 数据帧 RST（CTR=0）携带非法 ID 仍解析成功', () => {
+  // CTR=0、TYP=RST、Code=0x24：SvcID=0/IfID=0（数据帧非法）、InstID=0、
+  // StrmID=0xFF（保留值）——回显数据帧触发帧时可能出现，必须解析成功
+  const buf = Buffer.from([0x00, (TYP.RST << 6) | 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]);
+  const r = parseDatagram(buf, UDP_OPT);
+  assert.equal(r.ok, true);
+  assert.equal(r.frame.ctr, 0);
+  assert.equal(r.frame.svc_id, 0);
+  assert.equal(r.frame.if_id, 0);
+  assert.equal(r.frame.inst_id, 0);
+  assert.equal(r.frame.strm_id, 0xff);
+  // 步骤 2 约束仍生效：RST Code=0x01 非法 → RST(0x00)
+  const badCode = Buffer.from([0x00, (TYP.RST << 6) | 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]);
+  assert.equal(parseDatagram(badCode, UDP_OPT).rst.code, 0x00);
+  // 步骤 2 约束仍生效：RST PLB>0 → RST(0x00)
+  const badPlb = Buffer.from([0x01, (TYP.RST << 6) | 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00]);
+  assert.equal(parseDatagram(badPlb, UDP_OPT).rst.code, 0x00);
+});
+
+// ---- §4.3/§5.4：数据帧 ACK 不豁免步骤 3/4（严格口径） ----
+test('§4.3 数据帧 ACK 回显非法 ID → RST(0x00)；合法 ACK 正常解析', () => {
+  // SvcID=0 / IfID=0 / StrmID=0xFF：数据帧 ID 越界，ACK 不豁免 → RST(0x00)
+  const bad = Buffer.from([0x00, TYP.ACK << 6, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff]);
+  assert.equal(parseDatagram(bad, UDP_OPT).rst.code, 0x00);
+  // 仅 StrmID 越界（其余 ID 合法）：步骤 4 单独命中 → RST(0x00)
+  const badStrm = Buffer.from([0x00, TYP.ACK << 6, 0x00, 0x01, 0x00, 0x02, 0x03, 0xff]);
+  assert.equal(parseDatagram(badStrm, UDP_OPT).rst.code, 0x00);
+  // 合法数据帧 ACK：SvcID≠0、IfID≠0、InstID≠0、StrmID∈0x01~0xFE
+  const ok = Buffer.from([0x00, TYP.ACK << 6, 0x00, 0x01, 0x00, 0x02, 0x03, 0xfe]);
+  const r = parseDatagram(ok, UDP_OPT);
+  assert.equal(r.ok, true);
+  assert.equal(r.frame.typ, TYP.ACK);
+  assert.equal(r.frame.strm_id, 0xfe);
+});
+
 // ---- 2.29 控制帧 MSK=1 ----
 test('2.29 控制帧 MSK=1 → RST(0x00)（§10 硬性约定）', () => {
   const buf = Buffer.from([(1 << 7) | (1 << 3), (TYP.NON << 6) | 0x01, 0, 0, 0, 0, 0, 0]);
@@ -274,4 +327,62 @@ test('RST 帧形态：PLB=0 + 回显标识（§5.4）', () => {
   const r = parseDatagram(buf, UDP_OPT);
   assert.ok(r.ok);
   assert.equal(r.frame.code, RST_CODE.NOT_FOUND);
+});
+
+// ---- §3.6/§6.3 REN 清理：上层传入 "ip:" 前缀也必须命中数据池与控制池 ----
+test('§3.6/§6.3 REN 按来源 IP 前缀重置 StrmID 池', () => {
+  const m = new StrmManager();
+  assert.equal(m.allocClientStream('10.0.0.1:5400', 1, 1), 0x01);
+  assert.equal(m.allocControlStrm('10.0.0.1:5400'), 0x01);
+  assert.equal(m.allocClientStream('10.0.0.10:5400', 1, 1), 0x01); // 相似前缀的另一节点
+
+  m.resetPeer('10.0.0.1:'); // stack 收到 REN 时传入的正是 "ip:" 前缀
+
+  assert.equal(m.isControlStrmActive('10.0.0.1:5400', 0x01), false);
+  assert.equal(m.allocClientStream('10.0.0.1:5400', 1, 1), 0x01); // 重置后从池首分配
+  // 相似前缀节点不受影响：0x01 仍活跃 → 分配 0x02
+  assert.equal(m.allocClientStream('10.0.0.10:5400', 1, 1), 0x02);
+});
+
+// ---- §4.4 组播启发式：只覆盖 Offer/Find/REN，数据帧不得被误判 ----
+test('§4.4 UDP 组播启发式不误判数据帧与 REN', () => {
+  assert.equal(isMulticastLike(cf({ code: 0x01 })), true); // Offer
+  assert.equal(isMulticastLike(cf({ code: 0x02 })), true); // Find
+  assert.equal(isMulticastLike(cf({ ren: 1, code: 0x00 })), true); // REN
+  assert.equal(isMulticastLike(cf({ code: 0x00 })), false); // Ping（单播）
+  assert.equal(isMulticastLike(cf({ code: 0x03 })), false); // Subscribe
+  assert.equal(isMulticastLike(cf({ code: 0x04 })), false); // GetIDL
+  assert.equal(isMulticastLike(f({ typ: TYP.CON, code: 0x01 })), false); // 数据 Request
+  assert.equal(isMulticastLike(f({ typ: TYP.CON, code: 0x02 })), false); // 数据 FF
+});
+
+// ---- §3.2 Length 64 位语义：PLB=7 声明长度不得被 32 位截断 ----
+test('§3.2 Length 64 位语义（PLB=7）', () => {
+  // 手工构造数据帧头（PLB=7）：8B 帧头 + 7B Length
+  const hdr7 = (len) => {
+    const b = Buffer.alloc(15);
+    b[0] = 0x07; // CTR=0 REN=0 VER=0 MSK=0 PLB=7
+    b[1] = (TYP.NON << 6) | CODE.REQUEST;
+    b[2] = 0x10; b[3] = 0x00; // SvcID=0x1000
+    b[4] = 0x00; b[5] = 0x01; // IfID=1
+    b[6] = 0x01; b[7] = 0x01; // InstID=1 StrmID=1
+    let v = BigInt(len);
+    for (let i = 6; i >= 0; i--) { b[8 + i] = Number(v & 0xffn); v >>= 8n; }
+    return b;
+  };
+
+  // 2^40（远超 32 位，但在 Number 精确整数范围内）→ 原样保留
+  const h1 = parseHeader(hdr7(2n ** 40n), 0, { ver: 0, isUdp: false });
+  assert.equal(h1.state, 'ok');
+  assert.equal(h1.payloadLen, 2 ** 40);
+  assert.equal(h1.expectedTotal, 15 + 2 ** 40);
+
+  // 2^56−1（协议上限）超出 JS 精确整数范围 → 按实现承载上限拒绝，不截断
+  const h2 = parseHeader(hdr7(2n ** 56n - 1n), 0, { ver: 0, isUdp: false });
+  assert.equal(h2.state, 'invalid');
+  assert.equal(h2.rst.code, RST_CODE.PROTOCOL_VIOLATION); // TCP 语义
+
+  const h3 = parseHeader(hdr7(2n ** 56n - 1n), 0, { ver: 0, isUdp: true, maxPayloadLen: 1400 });
+  assert.equal(h3.state, 'invalid');
+  assert.equal(h3.rst.code, RST_CODE.PAYLOAD_TOO_LARGE); // UDP 帧级超限 0x23
 });

@@ -143,9 +143,18 @@ static void udp_drain(fw_stack_t *st, fw_fd_t fd, int which) {
     // 自我回环过滤（§2）
     if (is_local_self(st, ip, port, fd)) continue;
 
-    // 组播操作码启发式：Offer/Find 的解析违规按组播帧静默丢弃
-    //（平台限制：socket API 无法直接获知目的地址，对齐 fw-nodejs 偏差 5）
-    int multicast_like = n >= 2 && ((buf[1] & 0x3F) == FW_CODE_SD_OFFER || (buf[1] & 0x3F) == FW_CODE_SD_FIND);
+    // 组播候选启发式：socket API 无法获知目的地址。
+    // 只有控制帧范围内的 Offer/Find/REN 才可能是组播；数据帧（CTR=0）一律按
+    // 单播处理，否则 Request/FF 的解析违规会被错误静默（§1.2/§4.3）。
+    int multicast_like = 0;
+    if (n >= 2) {
+      int b0 = buf[0];
+      int code = buf[1] & 0x3F;
+      if ((b0 & 0x80) != 0 && (code == FW_CODE_SD_OFFER || code == FW_CODE_SD_FIND))
+        multicast_like = 1;
+      else if ((b0 & 0x80) != 0 && (b0 & 0x40) != 0 && code == 0x00)
+        multicast_like = 1; // REN（CTR=1、REN=1、Code=0）
+    }
 
     fw_parse_opts_t o;
     memset(&o, 0, sizeof(o));

@@ -191,28 +191,31 @@ export function parseHeader(buf, offset, opts = {}) {
   const strmId = buf[offset + 7];
   const echo = { ctr, svc_id: svcId, if_id: ifId, inst_id: instId, strm_id: strmId };
 
-  if (ctr === 1) {
-    // 控制帧 SvcID=0x0000 且 IfID=0x0000（§4.3 步骤 3）
-    if (svcId !== 0 || ifId !== 0) {
-      return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
-    }
-  } else {
-    // 数据帧 SvcID≠0 且 IfID≠0（§4.3 步骤 3）
-    if (svcId === 0 || ifId === 0) {
-      return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
-    }
-  }
-
-  // ---- 步骤 4：InstID/StrmID 校验 ----
-  if (ctr === 1) {
-    // 控制帧 InstID=0、REN=1 时 StrmID=0（§4.3 步骤 4）
-    if (instId !== 0) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
-    if (ren === 1 && strmId !== 0) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
-    if (typ === TYP.RST) {
-      // RST 帧豁免 StrmID 校验（实现偏差，见 README）：StrmID 是 §5.4 的回显字段
-      // （回显触发帧值，数据帧触发时可达 0xFF）——若按控制帧语义/范围校验，
-      // 会形成"RST 判违规 → 回 RST → 对端再判违规"的互射风暴
+  // ---- 步骤 3/4 豁免：任何 TYP=RST 都不校验 ID（§4.3 步骤 3/4 / §5.4） ----
+  // RST 的 SvcID/IfID/InstID/StrmID 是回显字段，取值来自触发帧，可能超出
+  // 控制帧或数据帧的合法范围（数据帧触发时 StrmID 可达 0xFE、SvcID/IfID 可能
+  // 为 0x0000）。RST 自身也可能是数据帧（CTR=0），回显越界 ID 同样合法，
+  // 因此不区分 CTR=1（控制帧）/CTR=0（数据帧）。若仍按步骤 3/4 校验，双方会
+  // "RST 判违规 → 回 RST → 对端再判违规"，形成 RST 回环风暴。
+  // RST 的形态与 Code 值域已在步骤 2 校验，故此处仅豁免 ID 相关校验。
+  if (typ !== TYP.RST) {
+    if (ctr === 1) {
+      // 控制帧 SvcID=0x0000 且 IfID=0x0000（§4.3 步骤 3）
+      if (svcId !== 0 || ifId !== 0) {
+        return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
+      }
     } else {
+      // 数据帧 SvcID≠0 且 IfID≠0（§4.3 步骤 3）
+      if (svcId === 0 || ifId === 0) {
+        return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
+      }
+    }
+
+    // ---- 步骤 4：InstID/StrmID 校验 ----
+    if (ctr === 1) {
+      // 控制帧 InstID=0、REN=1 时 StrmID=0（§4.3 步骤 4）
+      if (instId !== 0) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
+      if (ren === 1 && strmId !== 0) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
       // 控制帧 StrmID 范围：0x00（连接级）或 0x01~0x7F（会话/查询）→ 否则 RST(0x00)
       if (strmId > 0x7f) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
       // 控制帧 StrmID 语义校验（§4.3 步骤 4）：
@@ -227,13 +230,13 @@ export function parseHeader(buf, offset, opts = {}) {
           return multicastLike ? { state: 'silent' } : { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
         }
       }
-    }
-  } else {
-    // 数据帧 InstID≠0x00（§4.3 步骤 4）
-    if (instId === 0) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
-    // 数据帧 StrmID∈0x01~0xFE（0x00 连接级禁用、0xFF 保留，§6.1）→ 越界 RST(0x00)
-    if (strmId < 0x01 || strmId > 0xfe) {
-      return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
+    } else {
+      // 数据帧 InstID≠0x00（§4.3 步骤 4）
+      if (instId === 0) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
+      // 数据帧 StrmID∈0x01~0xFE（0x00 连接级禁用、0xFF 保留，§6.1）→ 越界 RST(0x00)
+      if (strmId < 0x01 || strmId > 0xfe) {
+        return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
+      }
     }
   }
 
@@ -242,6 +245,14 @@ export function parseHeader(buf, offset, opts = {}) {
   if (buf.length - offset < headerLen) return { state: 'need_more' };
   let payloadLen = 0;
   for (let i = 0; i < plb; i++) payloadLen = payloadLen * 256 + buf[offset + 8 + i];
+  // §3.2 Length 语义：PLB=7 时协议上限 2^56−1；JS Number 仅 2^53−1 以内可精确表示。
+  // 超出精确整数范围时，声明值无法可靠参与帧边界比较（会错位定界），按实现承载
+  // 上限处理：UDP 视为帧级超限（RST 0x23），TCP 视为协议违规（RST 0x00）；
+  // 绝不截断成小值后再定界。参考实现实际单帧上限另受 Buffer 容量约束。
+  if (payloadLen > Number.MAX_SAFE_INTEGER) {
+    return { state: 'invalid', rst: makeRst(
+      isUdp ? RST_CODE.PAYLOAD_TOO_LARGE : RST_CODE.PROTOCOL_VIOLATION, echo) };
+  }
   // UDP 帧级校验：超 max_payload_len → RST(0x23)（§4.3 步骤 5，仅 UDP）
   if (isUdp && payloadLen > maxPayloadLen) {
     return { state: 'invalid', rst: makeRst(RST_CODE.PAYLOAD_TOO_LARGE, echo) };

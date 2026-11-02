@@ -441,5 +441,57 @@ int suite_codec(void) {
   CHECK_EQ_MEM(with_crc, data, 5);
   TEST_END();
 
+  // §1.17 / 可行性：max_len 极大数组解码必须先按剩余字节限流预分配，
+  // 否则 n=max_len 会触发巨量内存分配（解码失败前即 OOM）
+  TEST_BEGIN("1.40 max_len 极大数组 + 短载荷 → UNDERRUN 且不预分配");
+  fw_tdesc_t elem_u8 = tdesc(FW_T_U8, -1, -1);
+  fw_tdesc_t big_array = tdesc(FW_T_ARRAY, -1, 2147483647);
+  big_array.element = &elem_u8;
+  uint8_t prefix_only[4] = {0x7F, 0xFF, 0xFF, 0xFF}; // 前缀 n=2^31-1，后无元素字节
+  pos = 0;
+  out = NULL;
+  CHECK_EQ_INT(fw_decode_field(&big_array, prefix_only, 4, &pos, &out), FW_DEC_UNDERRUN);
+  CHECK(out == NULL);
+  TEST_END();
+
+  // §13 / 功能：接口 input 超过 16 个类型时不得静默截断（17 个 u8 往返）
+  TEST_BEGIN("1.41 接口 17 个 input 类型往返（不截断）");
+  static const char *IDL17 =
+    "{\"service\":{\"name\":\"S\",\"svc_id\":1,\"major_ver\":1,\"minor_ver\":0,"
+    "\"interfaces\":[{\"name\":\"Many\",\"if_id\":1,\"type\":\"rpc\",\"transport\":\"tcp\","
+    "\"input\":[\"P\",\"P\",\"P\",\"P\",\"P\",\"P\",\"P\",\"P\",\"P\","
+    "\"P\",\"P\",\"P\",\"P\",\"P\",\"P\",\"P\",\"P\"],\"output\":\"P\"}]},"
+    "\"type_def\":{\"structs\":{\"P\":[{\"name\":\"v\",\"type\":\"u8\"}]}}}";
+  char err17[128] = {0};
+  fw_value_t *idl17 = fw_json_parse(IDL17, strlen(IDL17), err17, sizeof(err17));
+  CHECK(idl17 != NULL);
+  fw_schema_t *s17 = idl17 ? fw_schema_build(idl17, err17, sizeof(err17)) : NULL;
+  CHECK(s17 != NULL);
+  if (idl17) fw_value_free(idl17);
+  if (s17) {
+    fw_iface_t *if17 = fw_schema_iface(s17, 1);
+    CHECK(if17 != NULL);
+    fw_value_t *vals = fw_value_array(17);
+    CHECK(vals != NULL);
+    for (int i = 0; i < 17; i++) {
+      fw_value_t *st = fw_value_struct();
+      CHECK(st != NULL);
+      CHECK(fw_struct_set(st, "v", fw_value_uint((uint64_t)i)) == FW_OK);
+      CHECK(fw_array_push(vals, st) == FW_OK);
+    }
+    fw_buf_init(&b);
+    CHECK_EQ_INT(fw_encode_payload(s17, if17, 0, vals, &b, err17, sizeof(err17)), FW_OK);
+    CHECK_EQ_INT(b.len, 17); // 17 个 struct{P:u8}，全部编码
+    out = NULL;
+    CHECK_EQ_INT(fw_decode_payload(s17, if17, 0, b.p, (uint32_t)b.len, &out, err17, sizeof(err17)), FW_OK);
+    CHECK(out && out->type == FW_V_ARRAY);
+    CHECK_EQ_INT(out ? (int)out->as.arr.len : -1, 17); // 不再停在 16
+    if (out) fw_value_free(out);
+    fw_value_free(vals);
+    fw_buf_free(&b);
+    fw_schema_free(s17);
+  }
+  TEST_END();
+
   return 0;
 }
