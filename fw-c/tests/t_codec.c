@@ -44,6 +44,63 @@ static void set_field(fw_tfield_t *f, const char *name, fw_tdesc_t *t) {
   f->type = t;
 }
 
+// ------------------------------------------------------------
+// 1.42 辅助：构造含 N 个 input（全部引用 struct P:{u8}）的 IDL JSON。
+// max_payload < 0 表示不声明该字段。dst 需足够大（N=40 时约 400B）。
+// ------------------------------------------------------------
+static int build_many_idl(char *dst, size_t cap, int n, int max_payload) {
+  size_t off = 0;
+  int w = snprintf(dst, cap,
+      "{\"service\":{\"name\":\"S\",\"svc_id\":1,\"major_ver\":1,\"minor_ver\":0,"
+      "\"interfaces\":[{\"name\":\"Many\",\"if_id\":1,\"type\":\"rpc\",\"transport\":\"tcp\",\"input\":[");
+  if (w < 0 || (size_t)w >= cap) return -1;
+  off = (size_t)w;
+  for (int i = 0; i < n; i++) {
+    w = snprintf(dst + off, cap - off, i ? ",\"P\"" : "\"P\"");
+    if (w < 0 || (size_t)w >= cap - off) return -1;
+    off += (size_t)w;
+  }
+  if (max_payload >= 0)
+    w = snprintf(dst + off, cap - off,
+        "],\"output\":\"P\",\"max_payload\":%d}]},"
+        "\"type_def\":{\"structs\":{\"P\":[{\"name\":\"v\",\"type\":\"u8\"}]}}}", max_payload);
+  else
+    w = snprintf(dst + off, cap - off,
+        "],\"output\":\"P\"}]},"
+        "\"type_def\":{\"structs\":{\"P\":[{\"name\":\"v\",\"type\":\"u8\"}]}}}");
+  if (w < 0 || (size_t)w >= cap - off) return -1;
+  return 0;
+}
+
+// 1.42 辅助：按 N 个 input 构建 schema（失败返回 NULL）
+static fw_schema_t *many_schema_build(int n, int max_payload) {
+  char idl[4096];
+  char err[128] = {0};
+  if (build_many_idl(idl, sizeof(idl), n, max_payload) != 0) return NULL;
+  fw_value_t *doc = fw_json_parse(idl, strlen(idl), err, sizeof(err));
+  if (!doc) return NULL;
+  fw_schema_t *sc = fw_schema_build(doc, err, sizeof(err));
+  fw_value_free(doc);
+  return sc;
+}
+
+// 1.42 辅助：构造 n 个 struct{P:{v=i}} 的数组值（调用方负责 free）
+static fw_value_t *many_values(int n) {
+  fw_value_t *vals = fw_value_array((uint32_t)n);
+  if (!vals) return NULL;
+  for (int i = 0; i < n; i++) {
+    fw_value_t *st = fw_value_struct();
+    if (!st) { fw_value_free(vals); return NULL; }
+    if (fw_struct_set(st, "v", fw_value_uint((uint64_t)i)) != FW_OK ||
+        fw_array_push(vals, st) != FW_OK) {
+      fw_value_free(st);
+      fw_value_free(vals);
+      return NULL;
+    }
+  }
+  return vals;
+}
+
 int suite_codec(void) {
   size_t pos = 0;
   fw_value_t *out = NULL;
@@ -490,6 +547,113 @@ int suite_codec(void) {
     fw_value_free(vals);
     fw_buf_free(&b);
     fw_schema_free(s17);
+  }
+  TEST_END();
+
+  // 性能：接口类型表快/慢路径 —— ≤16 用栈缓冲（每帧零堆分配），>16 才 calloc。
+  // 覆盖 3（栈路径）/16（快路径边界）/17/40（慢路径）四条多参数编解码往返
+  // （单参数路径由既有接口级往返用例覆盖），以及三条失败出口，
+  // 确认 release 与分配完全对称（无泄漏、无双重释放）。
+  TEST_BEGIN("1.42 类型表快/慢路径往返（3/16/17/40）+ 失败路径");
+  {
+    int sizes[4] = {3, 16, 17, 40};
+    for (int k = 0; k < 4; k++) {
+      int n = sizes[k];
+      char err[128] = {0};
+      fw_schema_t *sc = many_schema_build(n, -1);
+      CHECK(sc != NULL);
+      if (!sc) continue;
+      fw_iface_t *iface = fw_schema_iface(sc, 1);
+      CHECK(iface != NULL);
+      fw_value_t *vals = many_values(n);
+      CHECK(vals != NULL);
+      if (iface && vals) {
+        fw_buf_init(&b);
+        CHECK_EQ_INT(fw_encode_payload(sc, iface, 0, vals, &b, err, sizeof(err)), FW_OK);
+        CHECK_EQ_INT((int)b.len, n); // 每个 struct{P:{u8}} 恰好 1B
+        out = NULL;
+        CHECK_EQ_INT(fw_decode_payload(sc, iface, 0, b.p, (uint32_t)b.len, &out, err, sizeof(err)), FW_OK);
+        CHECK(out && out->type == FW_V_ARRAY);
+        CHECK_EQ_INT(out ? (int)out->as.arr.len : -1, n);
+        if (out) {
+          // 逐位置校验回读值，确认快慢路径都以相同顺序解析
+          for (int i = 0; i < n; i++) {
+            fw_value_t *fv = fw_struct_get(out->as.arr.items[i], "v");
+            CHECK(fv && fv->type == FW_V_UINT);
+            CHECK_EQ_U64(fv ? fv->as.u : (uint64_t)~0, (uint64_t)i);
+          }
+          fw_value_free(out);
+          out = NULL;
+        }
+        fw_buf_free(&b);
+      }
+      fw_value_free(vals);
+      fw_schema_free(sc);
+    }
+  }
+
+  // 失败路径 (a)：堆路径 + 参数个数不符（17 个 input 只传 16 个值）→ FW_ERR_PARAM
+  {
+    char err[128] = {0};
+    fw_schema_t *sc = many_schema_build(17, -1);
+    CHECK(sc != NULL);
+    if (sc) {
+      fw_iface_t *iface = fw_schema_iface(sc, 1);
+      CHECK(iface != NULL);
+      fw_value_t *vals = many_values(16);
+      CHECK(vals != NULL);
+      if (iface && vals) {
+        fw_buf_init(&b);
+        CHECK_EQ_INT(fw_encode_payload(sc, iface, 0, vals, &b, err, sizeof(err)), FW_ERR_PARAM);
+        fw_buf_free(&b);
+      }
+      fw_value_free(vals);
+      fw_schema_free(sc);
+    }
+  }
+
+  // 失败路径 (b)：堆路径 + 载荷截断（17B 编码只喂 16B）→ FW_DEC_UNDERRUN
+  {
+    char err[128] = {0};
+    fw_schema_t *sc = many_schema_build(17, -1);
+    CHECK(sc != NULL);
+    if (sc) {
+      fw_iface_t *iface = fw_schema_iface(sc, 1);
+      CHECK(iface != NULL);
+      fw_value_t *vals = many_values(17);
+      CHECK(vals != NULL);
+      if (iface && vals) {
+        fw_buf_init(&b);
+        CHECK_EQ_INT(fw_encode_payload(sc, iface, 0, vals, &b, err, sizeof(err)), FW_OK);
+        out = NULL;
+        CHECK_EQ_INT(fw_decode_payload(sc, iface, 0, b.p, (uint32_t)(b.len - 1), &out, err, sizeof(err)),
+                     FW_DEC_UNDERRUN);
+        CHECK(out == NULL);
+        fw_buf_free(&b);
+      }
+      fw_value_free(vals);
+      fw_schema_free(sc);
+    }
+  }
+
+  // 失败路径 (c)：堆路径 + 超出接口 max_payload（17B > 16）→ FW_DEC_MAXLEN
+  {
+    char err[128] = {0};
+    fw_schema_t *sc = many_schema_build(17, 16);
+    CHECK(sc != NULL);
+    if (sc) {
+      fw_iface_t *iface = fw_schema_iface(sc, 1);
+      CHECK(iface != NULL);
+      fw_value_t *vals = many_values(17);
+      CHECK(vals != NULL);
+      if (iface && vals) {
+        fw_buf_init(&b);
+        CHECK_EQ_INT(fw_encode_payload(sc, iface, 0, vals, &b, err, sizeof(err)), FW_DEC_MAXLEN);
+        fw_buf_free(&b);
+      }
+      fw_value_free(vals);
+      fw_schema_free(sc);
+    }
   }
   TEST_END();
 
