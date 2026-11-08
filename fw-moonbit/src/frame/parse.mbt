@@ -2,9 +2,10 @@
 //
 // 校验顺序严格按 §4.3 步骤 1~4；步骤 5~8（Length/Mask/Payload）由各传输解析器执行
 // - 违规返回 Reject(code)：单播帧回 RST(code)，组播帧由调用方静默丢弃（§4.4）
-// - 传输控制帧（CTR=0 且 TYP∈{ACK,RST}）豁免步骤 3/4 的 ID 校验：
+// - 任何 TYP=RST 的帧（不区分 CTR=1 控制帧 / CTR=0 数据帧）豁免步骤 3/4 的 ID 校验：
 //   其 SvcID/IfID/InstID/StrmID 仅为回显归属（§5.4"RST 回显触发帧的 StrmID"），
-//   对畸形帧的 RST 回复若含 0 值 ID 不应自我违规（避免 RST 循环）
+//   对畸形帧的 RST 回复若含 0 值 ID 不应自我违规（避免 RST 循环）；
+//   ACK 不适用该豁免（数据帧 ACK 的 ID 回显必须落在合法范围，见 §4.3 说明）
 
 /// UDP 数据报解析结果（§4.2/§4.4）
 pub(all) enum ParseOutcome {
@@ -76,8 +77,9 @@ pub fn validate_header(h : FrameHeader, local_ver : Int, is_tcp : Bool) -> Int? 
   if is_tcp && (h.typ == Con || h.typ == Ack) {
     return Some(@errors.RST_OK)
   }
-  // GetIDL 仅 TCP 单播：UDP 上 CTR=1 且 Code=0x04 → 传输绑定违规（§4.3 步骤 2 / §7.2）
-  if !is_tcp && h.ctr && h.code == 0x04 {
+  // GetIDL 查询(0x04)/响应(0x11) 仅 TCP 单播：UDP 上 CTR=1 且 Code∈{0x04,0x11}
+  // → 传输绑定违规（§4.3 步骤 2 / §7.2）
+  if !is_tcp && h.ctr && (h.code == 0x04 || h.code == 0x11) {
     return Some(@errors.RST_OK)
   }
   // 仅 TYP=RST 豁免步骤 3/4 的 ID 校验（§4.3 步骤 3/4 / §5.4）：
@@ -115,11 +117,18 @@ pub fn validate_header(h : FrameHeader, local_ver : Int, is_tcp : Bool) -> Int? 
       }
       // 控制帧 StrmID 语义（§4.3 步骤 4，测试 2.17）：
       // Subscribe(0x03)/GetIDL(0x04) 必须 0x01~0x7F；连接级(0x00/0x01/0x02) 必须 0x00
+      // 例外二（口径定案）：ACK(0x10)/GetIDL 响应(0x11) 不参与流绑定校验，StrmID=0 合法
+      // （二者不在以上两个集合，天然不触发判定；此处注明防止后续误加约束）
       if (h.code == 0x03 || h.code == 0x04) && h.strm_id == 0 {
         return Some(@errors.RST_OK)
       }
       if (h.code == 0x00 || h.code == 0x01 || h.code == 0x02) && h.strm_id != 0 {
-        return Some(@errors.RST_OK)
+        // 例外（§3.7 专项定案优先）：Subscribe(TTL=0) 的取消确认 ACK(Code=0x00, CTR=1)
+        // 回显会话 StrmID（0x01~0x7F），属于合法形态；其余 Code=0x00 帧
+        // （心跳 Ping / REN）StrmID 仍必须 0x00。
+        if !(h.typ == Ack && h.code == 0x00) {
+          return Some(@errors.RST_OK)
+        }
       }
     } else {
       // 数据帧 InstID≠0x00（测试 2.15）

@@ -51,7 +51,14 @@ pub fn Rpc::call(
     // §5.1：TCP Request = NON，可靠性由 TCP 承担；连接未就绪时排队（on_tcp_connected 排空）
     // TCP 目标端口 = §2 fw_tcp_port（发现端口仅 UDP 单播语义，§5.6/§7.2）
     let spec = @frame.data_spec(@frame.Non, 0x01, svc_id, if_id, inst_id, strm)
-    self.tcp_send_or_wait(host, spec, payload)
+    // §12.6：TCP 数据帧写失败（队列满，一字节未写或连接失效）→ 回滚 pending + StrmID
+    // 并上抛错误（不挂响应超时）——不能"丢了请求还占着槽"
+    let accepted = self.tcp_send_or_wait(host, spec, payload, fn() {
+      self.call_fail(key, @errors.Local("tcp send not written (queue full or closed): peer=\{host}"))
+    })
+    if !accepted {
+      return
+    }
   } else {
     // §5.1：UDP Request = CON → 重传链（0/200/600/1400ms，§5.5）
     let spec = @frame.data_spec(@frame.Con, 0x01, svc_id, if_id, inst_id, strm)
@@ -75,17 +82,27 @@ pub fn Rpc::call(
   p.resp_timer = rp_set_timeout(fn(_) { self.call_timeout(key) }, timeout)
 }
 
-/// 响应超时触发：清理 pending + 重传链 + StrmID，上抛 RequestTimeout（§5.1/§5.5）
-fn Rpc::call_timeout(self : Rpc, key : String) -> Unit {
+/// 请求失败收尾（§5.1 终态 / §12.6 写失败回滚）：
+/// 清理响应超时 + pending + 待确认重传链 + StrmID，上抛错误。幂等（pending 已移除则忽略）。
+fn Rpc::call_fail(self : Rpc, key : String, err : @errors.FwError) -> Unit {
   match self.pending.get(key) {
     Some(p) => {
+      if p.resp_timer != -1 {
+        rp_clear_timeout(p.resp_timer)
+        p.resp_timer = -1
+      }
       let _ = self.pending.remove(key)
       self.cancel_con(key)
       self.data_pool.release(key_peer(key), p.svc_id, p.inst_id, p.strm_id)
-      (p.on_err)(@errors.RequestTimeout)
+      (p.on_err)(err)
     }
     None => ()
   }
+}
+
+/// 响应超时触发：走统一失败收尾，上抛 RequestTimeout（§5.1/§5.5）
+fn Rpc::call_timeout(self : Rpc, key : String) -> Unit {
+  self.call_fail(key, @errors.RequestTimeout)
 }
 
 /// 取消该键的 CON 重传链（幂等；不存在则忽略）
@@ -130,7 +147,10 @@ pub fn Rpc::fire_forget(
     // §6.2：NON Fire-Forget 发送完成即 Closed → 立即释放 StrmID
     // TCP 目标端口 = §2 fw_tcp_port（发现端口仅 UDP 单播语义，§5.6/§7.2）
     let spec = @frame.data_spec(@frame.Non, 0x02, svc_id, if_id, inst_id, strm)
-    self.tcp_send_or_wait(host, spec, payload)
+    // §12.6：写失败由 on_fail 上抛；无论成败 StrmID 均在下方释放（FF 发送完成即 Closed，§6.2）
+    let _ = self.tcp_send_or_wait(host, spec, payload, fn() {
+      on_err(@errors.Local("tcp send not written (queue full or closed): peer=\{host}"))
+    })
     self.data_pool.release(host, svc_id, inst_id, strm)
   } else {
     // §5.5：CON FF 走重传链，Stream 保持 Active 至 ACK 收到或重传耗尽（§6.2）
@@ -155,24 +175,40 @@ pub fn Rpc::fire_forget(
 
 /// TCP 发送或排队（连接未就绪时入等待队列，on_tcp_connected 排空补发，§5.6）；
 /// 目标端口恒 = §2 fw_tcp_port（host 参数为发现获得的对端 IP）
+///
+/// 返回 true = 已写入连接 或 已受理进等待队列；false = 立即写入失败。
+/// §12.6：数据帧被拒（发送队列满，**一字节都未写入**）时同步回调 on_fail，
+/// 由调用方回滚 pending/StrmID；排队后的补发若失败亦回调 on_fail。
 fn Rpc::tcp_send_or_wait(
   self : Rpc,
   host : String,
   spec : @frame.FrameSpec,
-  payload : Bytes
-) -> Unit {
+  payload : Bytes,
+  on_fail : () -> Unit
+) -> Bool {
   let conn_id = self.transport.tcp_connect(host, self.transport.cfg.tcp_port)
   if self.transport.is_alive(conn_id) {
-    let _ = self.transport.send_tcp_frame(conn_id, spec, payload)
-  } else {
-    // 键 = host|fw_tcp_port（与 on_tcp_connected 排空侧一致：出站连接目标端口恒为 §2 fw_tcp_port）
-    let key = "\{host}|\{self.transport.cfg.tcp_port}"
-    let job = fn() { let _ = self.transport.send_tcp_frame(conn_id, spec, payload) }
-    match self.conn_wait.get(key) {
-      Some(q) => q.push(job)
-      None => self.conn_wait[key] = [job]
+    if self.transport.send_tcp_frame(conn_id, spec, payload) {
+      return true
+    }
+    rp_log_error("[rpc] TCP 数据帧未写入（队列满或连接失效）: host=\{host}")
+    on_fail()
+    return false
+  }
+  // 键 = host|fw_tcp_port（与 on_tcp_connected 排空侧一致：出站连接目标端口恒为 §2 fw_tcp_port）
+  let key = "\{host}|\{self.transport.cfg.tcp_port}"
+  let job = fn() {
+    if !self.transport.send_tcp_frame(conn_id, spec, payload) {
+      rp_log_error("[rpc] TCP 数据帧补发未写入（队列满或连接失效）: host=\{host}")
+      on_fail()
     }
   }
+  match self.conn_wait.get(key) {
+    Some(q) => q.push(job)
+    None => self.conn_wait[key] = [job]
+  }
+  // 已受理进等待队列：后续成败由 on_fail / 正常响应回调决定
+  true
 }
 
 // ===== 客户端收帧处理（stack 层桥接：Code=0x10 响应 / TYP=RST / TYP=ACK 分流） =====

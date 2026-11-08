@@ -28,12 +28,19 @@ typedef struct {
 
 struct fw_strm_mgr {
   // 数据帧池：key = "peer|svc|inst"，client(0x01~0x7F)/server(0x80~0xFE) 独立
-  struct { char key[160]; fw_pool_t client, server; } *data;
+  // last_used_ms：最近一次分配/释放时刻（R3-9 空闲回收判定，两池共用同一时刻）
+  struct { char key[160]; fw_pool_t client, server; int64_t last_used_ms; } *data;
   int ndata, datacap;
   // 控制帧统一池（订阅会话 + GetIDL 查询）：key = peer（§3.5/§6.3）
-  struct { char peer[80]; fw_pool_t pool; } *ctrl;
+  struct { char peer[80]; fw_pool_t pool; int64_t last_used_ms; } *ctrl;
   int nctrl, ctrlcap;
 };
+
+// 池是否活跃（存在已分配未释放的 StrmID）
+static int pool_has_active(const fw_pool_t *p) {
+  for (int i = 0; i < 128; i++) if (p->active[i]) return 1;
+  return 0;
+}
 
 static void pool_init(fw_pool_t *p, uint8_t low, uint8_t high) {
   memset(p, 0, sizeof(*p));
@@ -75,8 +82,15 @@ static void pool_release(fw_pool_t *p, int id) {
   }
 }
 
+// 收到 REN=1：清除该对端全部序列（§3.6/§6.3）。
+// 必须同时清除冷却记录与分配游标——对端已重启，上一代连接留下的释放序号
+// 不应继续影响新会话的分配次序（与 fw-nodejs/MoonBit 的 reset 语义一致）。
 static void pool_reset(fw_pool_t *p) {
-  for (int i = 0; i < 128; i++) p->active[i] = 0;
+  for (int i = 0; i < 128; i++) {
+    p->active[i] = 0;
+    p->release_seq[i] = -1; // -1 = 从未释放（恢复初始态）
+  }
+  p->alloc_seq = 0; // 游标归零，后续分配从池起点重新开始
 }
 
 fw_strm_mgr_t *fw_strm_new(void) {
@@ -94,7 +108,10 @@ static fw_pool_t *data_pool(fw_strm_mgr_t *m, const char *peer, uint16_t svc, ui
   char key[160];
   snprintf(key, sizeof(key), "%s|%u|%u", peer, svc, inst);
   for (int i = 0; i < m->ndata; i++) {
-    if (strcmp(m->data[i].key, key) == 0) return server ? &m->data[i].server : &m->data[i].client;
+    if (strcmp(m->data[i].key, key) == 0) {
+      m->data[i].last_used_ms = fw_now_ms(); // R3-9：刷新活跃时刻
+      return server ? &m->data[i].server : &m->data[i].client;
+    }
   }
   if (m->ndata == m->datacap) {
     int nc = m->datacap ? m->datacap * 2 : 8;
@@ -105,6 +122,7 @@ static fw_pool_t *data_pool(fw_strm_mgr_t *m, const char *peer, uint16_t svc, ui
   }
   memset(&m->data[m->ndata], 0, sizeof(m->data[m->ndata]));
   snprintf(m->data[m->ndata].key, sizeof(m->data[m->ndata].key), "%s", key);
+  m->data[m->ndata].last_used_ms = fw_now_ms(); // R3-9：新建即视为刚活跃
   pool_init(&m->data[m->ndata].client, 0x01, 0x7F);   // 客户端流 127 个（§6.1）
   pool_init(&m->data[m->ndata].server, 0x80, 0xFE);   // 服务端流 127 个
   m->ndata++; // 登记（缺失将导致每次分配都重建池、active 状态丢失）
@@ -113,7 +131,10 @@ static fw_pool_t *data_pool(fw_strm_mgr_t *m, const char *peer, uint16_t svc, ui
 
 static fw_pool_t *ctrl_pool(fw_strm_mgr_t *m, const char *peer) {
   for (int i = 0; i < m->nctrl; i++) {
-    if (strcmp(m->ctrl[i].peer, peer) == 0) return &m->ctrl[i].pool;
+    if (strcmp(m->ctrl[i].peer, peer) == 0) {
+      m->ctrl[i].last_used_ms = fw_now_ms(); // R3-9：刷新活跃时刻
+      return &m->ctrl[i].pool;
+    }
   }
   if (m->nctrl == m->ctrlcap) {
     int nc = m->ctrlcap ? m->ctrlcap * 2 : 8;
@@ -124,6 +145,7 @@ static fw_pool_t *ctrl_pool(fw_strm_mgr_t *m, const char *peer) {
   }
   memset(&m->ctrl[m->nctrl], 0, sizeof(m->ctrl[m->nctrl]));
   snprintf(m->ctrl[m->nctrl].peer, sizeof(m->ctrl[m->nctrl].peer), "%s", peer);
+  m->ctrl[m->nctrl].last_used_ms = fw_now_ms(); // R3-9：新建即视为刚活跃
   pool_init(&m->ctrl[m->nctrl].pool, 0x01, 0x7F); // 会话/查询同池（§6.1/§6.3）
   m->nctrl++; // 登记（同 data_pool：缺失将导致每次分配都重建池）
   return &m->ctrl[m->nctrl - 1].pool;
@@ -176,4 +198,47 @@ void fw_strm_reset_peer(fw_strm_mgr_t *m, const char *peer_prefix) {
     // ctrl 池键为 "ip:port"，REN 前缀为 "ip:" → 前缀匹配（§3.6 清该对端全部序列）
     if (strncmp(m->ctrl[i].peer, peer_prefix, pl) == 0) pool_reset(&m->ctrl[i].pool);
   }
+}
+
+// R3-9：回收空闲 Strm 池。判定 = 无活跃 StrmID + 距最近分配/释放 >= idle_ms。
+// 回收只发生在池已完全空闲之后，因此不会破坏冷却/序列语义：重新请求时重建池即回到
+// 初始状态（与新对端首次分配一致，§6.3 的冷却只约束同一池内 `alloc_seq` 的先后顺序）。
+int fw_strm_sweep(fw_strm_mgr_t *m, int64_t now_ms, uint32_t idle_ms) {
+  if (!m || idle_ms == 0) return 0;
+  int removed = 0;
+  // 数据池：交换删除（尾元素移到空位），保持数组紧凑
+  for (int i = 0; i < m->ndata;) {
+    int64_t idle = now_ms - m->data[i].last_used_ms;
+    // idle_ms 为 uint32_t，与 int64_t 比较需提升；负值（时钟回退）不回收
+    if (idle >= (int64_t)idle_ms && !pool_has_active(&m->data[i].client) &&
+        !pool_has_active(&m->data[i].server)) {
+      m->data[i] = m->data[m->ndata - 1];
+      m->ndata--;
+      removed++;
+      continue;
+    }
+    i++;
+  }
+  for (int i = 0; i < m->nctrl;) {
+    int64_t idle = now_ms - m->ctrl[i].last_used_ms;
+    if (idle >= (int64_t)idle_ms && !pool_has_active(&m->ctrl[i].pool)) {
+      m->ctrl[i] = m->ctrl[m->nctrl - 1];
+      m->nctrl--;
+      removed++;
+      continue;
+    }
+    i++;
+  }
+  // 收缩容量（避免回收后长期保留过大的表；空的直接释放）
+  if (m->ndata == 0 && m->data) {
+    free(m->data);
+    m->data = NULL;
+    m->datacap = 0;
+  }
+  if (m->nctrl == 0 && m->ctrl) {
+    free(m->ctrl);
+    m->ctrl = NULL;
+    m->ctrlcap = 0;
+  }
+  return removed;
 }

@@ -173,8 +173,9 @@ export function parseHeader(buf, offset, opts = {}) {
   if (!isUdp && (typ === TYP.CON || typ === TYP.ACK)) {
     return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echoPartial(buf, offset, ctr)) };
   }
-  // GetIDL 仅走 TCP 单播（§7.2）：UDP 上收到 → RST(0x00)，组播帧静默丢弃
-  if (isUdp && ctr === 1 && code === 0x04) {
+  // GetIDL 查询(0x04) 与 GetIDL 响应(0x11) 仅走 TCP 单播（§7.2）：
+  // UDP 上收到 → RST(0x00)，组播帧静默丢弃
+  if (isUdp && ctr === 1 && (code === 0x04 || code === 0x11)) {
     return multicastLike
       ? { state: 'silent' }
       : { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echoPartial(buf, offset, ctr)) };
@@ -220,6 +221,8 @@ export function parseHeader(buf, offset, opts = {}) {
       if (strmId > 0x7f) return { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
       // 控制帧 StrmID 语义校验（§4.3 步骤 4）：
       //   Code∈{0x03,0x04} → StrmID∈0x01~0x7F；Code∈{0x00,0x01,0x02} → StrmID=0x00
+      //   例外二（口径定案）：ACK(0x10)/GetIDL 响应(0x11) 不参与流绑定校验，StrmID=0 合法。
+      //   二者不在上述两个集合内，故不做语义判定——此处仅保留注释，防止后续误加约束。
       if (CTRL_STRM_SESSION_CODES.has(code) && strmId === 0) {
         return multicastLike ? { state: 'silent' } : { state: 'invalid', rst: makeRst(RST_CODE.PROTOCOL_VIOLATION, echo) };
       }
@@ -327,23 +330,37 @@ function xorMask(data, key) {
 // 分包保存状态等待；粘包逐帧交付；半帧两阶段由连接管理层驱动。
 // ============================================================
 
+// TCP 解析器空缓冲常量（_resetBuf 复用，避免逐帧分配空 Buffer）
+const EMPTY_BUF = Buffer.alloc(0);
+
 export class TcpStreamParser {
   /**
    * @param {object} opts { ver=0, onFrame(frame), onRst(rst), onDropComplete() }
    */
   constructor(opts = {}) {
     this.opts = opts;
-    this.buf = Buffer.alloc(0);   // 待解析字节（分包不丢弃已读字节，§4.1）
+    // 接收缓冲：底层容量缓冲 buf + 有效区间 [off, fill)。
+    // 不再对每个到达的块做 Buffer.concat（那会每次重拷已缓冲字节 → 大帧分片 O(n²)）；
+    // 追加为摊销 O(1)，消费仅移动 off，必要时按"消费过半"策略压实（摊销 O(n)）。
+    this.buf = EMPTY_BUF;
+    this.off = 0;                 // 未消费字节起点（当前帧首字节）
+    this.fill = 0;                // 已填充字节终点
+    this.cap = 0;                 // 缓冲容量（buf.length）
     this.receiving = false;       // 是否有帧正在接收（帧首字节已到达且未交付）
     this.headerInfo = null;       // 当前帧已解析的头信息（帧头完整后非空）
     this.receivedBytes = 0;       // 当前帧已收总字节数（含帧头）
     // 丢弃模式（§4.1 阶段二）
     this.dropMode = false;
     this.dropRemaining = 0;       // 丢弃模式剩余待丢弃字节数（R = L − 已收）
+    // 违规帧定界状态（§4.1）：违规帧已回 RST，但其帧尾字节同样必须完整消费，
+    // 否则残留字节会与后续帧首字节拼成"合法"帧（帧走私/边界错位）。
+    this.invalidPending = false;  // 帧头（含 Length/Mask）未收齐，等待到齐后定界
+    this.invalidHeadLen = 0;
+    this.abandoned = false;       // 声明长度超出可精确表示范围，同步已丢失（等连接层超时关闭）
   }
 
   /** 是否有帧正在接收（供半帧超时判定） */
-  isReceiving() { return this.receiving || this.dropMode; }
+  isReceiving() { return this.receiving || this.dropMode || this.invalidPending || this.abandoned; }
 
   /** 当前帧帧头是否已收齐（≥8B 含 Length/Masking Key，§4.1 阶段判定） */
   isHeaderComplete() { return this.headerInfo !== null; }
@@ -354,10 +371,53 @@ export class TcpStreamParser {
   }
 
   /**
-   * 进入丢弃模式（帧头完整、Payload 不完整时由连接层调用，§4.1）。
-   * 已收的当前帧字节（buf）立即全部丢弃（帧已作废）；剩余 R = L − 已收 字节
-   * 从后续到达的字节中精确消耗，收满后恢复 IDLE。
+   * 从当前帧已收字节中取 StrmID（字节 7）；未收满 8B 返回 0。
+   * 供连接层半帧阶段二的 RST 回显使用（§5.4）。必须基于有效区间起点 off 取址——
+   * 同一缓冲内可能已消费过多帧，绝对下标会读到上一帧或未消费区域的字节。
    */
+  currentStrmId() {
+    if (this._avail() < 8) return 0;
+    return this.buf[this.off + 7];
+  }
+
+  /** 当前未消费字节数（有效区间长度） */
+  _avail() { return this.fill - this.off; }
+
+  /**
+   * 清空有效区间（§4.1 消费完当前帧）。
+   * 一律释放底层缓冲：空缓冲时 feed() 会零拷贝接管新块（见 feed 的 avail===0 分支），
+   * 保留缓冲没有任何性能收益；反而会让已交付的 payload 视图（subarray 指向同一内存）
+   * 在后续 feed 写回前部时被覆写（别名风险）。释放后视图仍指向旧 Buffer 对象，安全。
+   */
+  _resetBuf() {
+    this.off = 0;
+    this.fill = 0;
+    this.buf = EMPTY_BUF;
+    this.cap = 0;
+  }
+
+  /** 消费前 n 字节；必要时压实（消费过半才搬迁，搬迁总代价摊销 O(n)） */
+  _consume(n) {
+    this.off += n;
+    if (this.off >= this.fill) { this._resetBuf(); return; }
+    if (this.off >= 4096 && this.off >= this.fill - this.off) this._compact();
+  }
+
+  /** 压实：把未消费区间搬回缓冲起点（用独立缓冲，避免 Buffer.copy 重叠语义不确定） */
+  _compact() {
+    const avail = this.fill - this.off;
+    if (avail === 0) { this._resetBuf(); return; }
+    const nc = avail * 2 > 1024 ? avail * 2 : 1024; // 预留约一半尾部空间供后续追加
+    const nb = Buffer.allocUnsafe(nc);
+    this.buf.copy(nb, 0, this.off, this.fill);
+    this.buf = nb;
+    this.cap = nc;
+    this.fill = avail;
+    this.off = 0;
+  }
+
+  /** 进入丢弃模式（帧头完整、Payload 不完整时由连接层调用，§4.1）。
+   * 已收的当前帧字节立即全部丢弃；剩余 R = L − 已收 从后续字节精确消耗，收满恢复 IDLE。 */
   enterDropMode() {
     if (!this.headerInfo) return;
     const info = this.headerInfo;
@@ -366,28 +426,106 @@ export class TcpStreamParser {
     this.receiving = false;
     this.headerInfo = null;
     this.receivedBytes = 0;
-    this.buf = Buffer.alloc(0); // 已收的当前帧字节全部作废（receivedBytes 与 buf.length 恒等）
+    this._resetBuf(); // 已收的当前帧字节全部作废（receivedBytes 与 avail 恒等）
     this._consumeDrop();
   }
 
   /** 喂入字节块；触发 onFrame/onRst/onDropComplete 回调 */
   feed(chunk) {
-    this.buf = Buffer.concat([this.buf, chunk]);
+    if (this.abandoned) return; // 同步已丢失：不再缓冲（连接层半帧超时会关闭连接）
+    if (chunk.length === 0) return;
+    const avail = this._avail();
+    if (avail === 0 && this.off === 0) {
+      // 缓冲为空：直接接管本块（零拷贝，常见路径）
+      this.buf = chunk;
+      this.cap = chunk.length;
+      this.fill = chunk.length;
+      this.off = 0;
+      this._loop();
+      return;
+    }
+    if (this.fill + chunk.length > this.cap) {
+      // 尾部空间不足：先压实腾出空间；仍不足则按需扩容（几何增长，摊销 O(1) 追加）
+      if (this.off > 0) this._compact();
+      if (this.fill + chunk.length > this.cap) {
+        let nc = this.cap ? this.cap : 1024;
+        while (nc < this.fill + chunk.length) nc *= 2;
+        const nb = Buffer.allocUnsafe(nc);
+        if (this.fill > 0) this.buf.copy(nb, 0, 0, this.fill);
+        this.buf = nb;
+        this.cap = nc;
+      }
+    }
+    chunk.copy(this.buf, this.fill);
+    this.fill += chunk.length;
     this._loop();
   }
 
+  /**
+   * 违规帧定界（§4.1）：违规帧已回 RST，但其帧尾字节必须完整消费——若直接清空
+   * 缓冲，帧尾残留会与后续帧首字节拼成"合法"帧（帧走私/帧边界错位）。
+   * 帧头（含 Length/Mask）到齐后按声明总长精确跳过；未收齐则进入丢弃模式。
+   * @returns {boolean} true=已定界（可继续解析）；false=需等待更多字节/同步已丢失
+   */
+  _resolveInvalid() {
+    const avail = this._avail();
+    if (avail < this.invalidHeadLen) return false; // 帧头未齐：保留缓冲等待
+    const b0 = this.buf[this.off];
+    const plb = b0 & 0x07;
+    let plen = 0;
+    for (let i = 0; i < plb; i++) plen = plen * 256 + this.buf[this.off + 8 + i];
+    const total = this.invalidHeadLen + plen;
+    this.invalidPending = false;
+    this.invalidHeadLen = 0;
+    if (!Number.isSafeInteger(total)) {
+      // 声明长度超出 JS 精确表示范围（§3.2 64 位语义）：无法定界且不得截断，
+      // 置同步丢失——继续接收已无意义，交由连接层半帧超时按 §4.1 阶段一关闭连接。
+      this._resetBuf();
+      this.abandoned = true;
+      this.receiving = false;
+      this.headerInfo = null;
+      this.receivedBytes = 0;
+      return false;
+    }
+    if (avail >= total) {
+      this._consume(total); // 跳过整个违规帧，继续解析后续帧
+      this.receiving = false;
+      this.headerInfo = null;
+      this.receivedBytes = 0;
+      return true;
+    }
+    // 帧尾未到齐：进入丢弃模式，剩余 R = L − 已收 从后续字节精确消耗（§4.1 阶段二）
+    this.dropMode = true;
+    this.dropRemaining = total - avail;
+    this.receiving = false;
+    this.headerInfo = null;
+    this.receivedBytes = 0;
+    this._resetBuf(); // 已收的当前帧字节全部作废
+    return true;
+  }
+
   _loop() {
+    if (this.abandoned) return;
     // 先消耗丢弃模式
     if (this.dropMode) {
       this._consumeDrop();
-      if (this.buf.length === 0) return;
+      if (this._avail() === 0) return;
+    }
+    // 违规帧帧头到齐后定界（RST 已在首次判定时回复，此处不重复）
+    if (this.invalidPending) {
+      if (!this._resolveInvalid()) return;
+      if (this.dropMode) {
+        this._consumeDrop();
+        if (this._avail() === 0) return;
+      }
     }
     // 逐帧解析（粘包逐帧交付，§4.1）
     for (;;) {
-      if (this.buf.length === 0) {
+      const avail = this._avail();
+      if (avail === 0) {
         // 缓冲耗尽：若尚未收到任何当前帧字节，退出接收状态（避免空帧误触半帧超时）
         if (!this.headerInfo && this.receivedBytes === 0) this.receiving = false;
-        break;
+        return;
       }
       if (!this.receiving) {
         // 新帧开始：首字节到达（§4.1 半帧计时起点由连接层依据 receiving 判定）
@@ -395,52 +533,39 @@ export class TcpStreamParser {
         this.receivedBytes = 0;
         this.headerInfo = null;
       }
-      const h = parseHeader(this.buf, 0, { ver: this.opts.ver ?? 0 });
+      // 交给解析器的是 [off, fill) 的视图（subarray 不复制，避免整段拷贝）
+      const h = parseHeader(this.buf.subarray(this.off, this.fill), 0, { ver: this.opts.ver ?? 0 });
       if (h.state === 'need_more') break; // 分包：保存状态等待（§4.1）
 
       if (h.state === 'invalid') {
-        // 违规帧：回 RST。若能读出声明帧总长则精确跳过该帧继续解析；无法定界则清空缓冲。
+        // 违规帧：立即回 RST（同一违规帧只回一次）。随后必须按声明长度定界：
+        // 帧头未齐先等待，到齐后跳过整帧或进入丢弃模式。
         this.opts.onRst?.(h.rst);
-        const b0 = this.buf[0];
-        const plb = b0 & 0x07;
-        const hasMsk = ((b0 >> 3) & 1) === 1;
-        const headLen = 8 + plb + (hasMsk ? 4 : 0);
-        let skipped = false;
-        if (this.buf.length >= headLen) {
-          let plen = 0;
-          for (let i = 0; i < plb; i++) plen = plen * 256 + this.buf[8 + i];
-          const total = headLen + plen;
-          if (this.buf.length >= total) {
-            this.buf = this.buf.subarray(total); // 跳过违规帧，继续解析后续帧
-            this.receiving = false;
-            this.headerInfo = null;
-            skipped = true;
-          }
-        }
-        if (!skipped) {
-          // 无法定界（Payload Length 值未到齐）：清空缓冲（违规帧尾无法重同步）
-          this.buf = Buffer.alloc(0);
-          this.receiving = false;
-          this.headerInfo = null;
-          break;
+        const b0 = this.buf[this.off];
+        this.invalidPending = true;
+        this.invalidHeadLen = 8 + (b0 & 0x07) + (((b0 >> 3) & 1) === 1 ? 4 : 0);
+        if (!this._resolveInvalid()) return;
+        if (this.dropMode) {
+          this._consumeDrop();
+          if (this._avail() === 0) return;
         }
         continue;
       }
       // h.state === 'ok'：帧头已解析，等 Payload
       this.headerInfo = h;
-      if (this.buf.length < h.expectedTotal) {
-        this.receivedBytes = this.buf.length; // 当前帧已收字节（此前帧均已消费）
+      if (avail < h.expectedTotal) {
+        this.receivedBytes = avail; // 当前帧已收字节（此前帧均已消费）
         break; // 分包：保存状态等待（§4.1）
       }
       // 收齐：交付（ver 随帧传出，§3.2 —— 与 parseDatagram 交付口径一致）
-      let payload = this.buf.subarray(h.headerLen, h.expectedTotal);
+      let payload = this.buf.subarray(this.off + h.headerLen, this.off + h.expectedTotal);
       if (h.msk) payload = xorMask(payload, h.maskKey);
       const frame = {
         ver: h.ver, ctr: h.ctr, ren: h.ren, msk: h.msk, typ: h.typ, code: h.code,
         svc_id: h.svcId, if_id: h.ifId, inst_id: h.instId, strm_id: h.strmId,
         payload,
       };
-      this.buf = this.buf.subarray(h.expectedTotal);
+      this._consume(h.expectedTotal);
       this.receiving = false;
       this.headerInfo = null;
       this.receivedBytes = 0;
@@ -451,16 +576,17 @@ export class TcpStreamParser {
   /** 丢弃模式字节消耗（§4.1：精确丢弃 R 字节，收满恢复 IDLE） */
   _consumeDrop() {
     while (this.dropMode && this.dropRemaining > 0) {
-      if (this.buf.length === 0) return; // 待丢弃字节未到齐，等待后续 feed
-      const n = Math.min(this.dropRemaining, this.buf.length);
-      this.buf = this.buf.subarray(n);   // 从 buf 头部精确消耗（后续 feed 字节持续追加）
+      const avail = this._avail();
+      if (avail === 0) return; // 待丢弃字节未到齐，等待后续 feed
+      const n = Math.min(this.dropRemaining, avail);
+      this._consume(n); // 从有效区间头部精确消耗（后续 feed 字节持续追加）
       this.dropRemaining -= n;
     }
     if (this.dropMode && this.dropRemaining === 0) {
       // 退出条件 1：收满剩余 R 字节 → 恢复正常接收（连接继续复用，§4.1）
       this.dropMode = false;
       this.opts.onDropComplete?.();
-      if (this.buf.length > 0) this._loop(); // 剩余字节属于后续帧，继续正常解析
+      if (this._avail() > 0) this._loop(); // 剩余字节属于后续帧，继续正常解析
     }
   }
 }

@@ -59,7 +59,9 @@ test('1.3/1.4 PLB 边界与 Payload Length 编码', () => {
   assert.equal(calcPlb(0), 0);
   assert.equal(calcPlb(1), 1);
   assert.equal(calcPlb(255), 1);
+  assert.equal(calcPlb(256), 2); // 阈值 +1：必须进位到 2B
   assert.equal(calcPlb(65535), 2);
+  assert.equal(calcPlb(65536), 3); // 阈值 +1：必须进位到 3B
   assert.equal(calcPlb(2 ** 48 - 1), 6);
   assert.equal(calcPlb(2 ** 53 - 1), 7); // Number 可精确表示范围内的 PLB=7 边界
   // PLB=0：无 Length 字段，帧大小 8B（1.30）
@@ -72,6 +74,25 @@ test('1.3/1.4 PLB 边界与 Payload Length 编码', () => {
   const p65535 = f({ payload: Buffer.alloc(65535) });
   assert.equal(p65535[0] & 0x07, 2);
   assert.equal(p65535.readUInt16BE(8), 65535);
+});
+
+test('轮A MSK 全 FF 密钥 + 单字节帧 + ID 极值', () => {
+  // 全 FF 密钥 + 1B payload + ID 极值：0x00 ^ 0xFF = 0xFF 编码，解码须还原原文
+  const key = Buffer.alloc(4, 0xff);
+  const buf = encodeFrame({
+    ctr: 0, typ: TYP.NON, code: 0x01,
+    svc_id: 0xffff, if_id: 0xffff, inst_id: 0xff, strm_id: 0xfe,
+    msk: 1, maskKey: key, payload: Buffer.from([0x00]),
+  });
+  assert.equal(buf.length, 8 + 1 + 4 + 1); // 单字节 payload → PLB=1
+  const r = parseDatagram(buf, UDP_OPT);
+  assert.ok(r.ok);
+  assert.equal(r.frame.svc_id, 0xffff);
+  assert.equal(r.frame.if_id, 0xffff);
+  assert.equal(r.frame.inst_id, 0xff);
+  assert.equal(r.frame.strm_id, 0xfe);
+  assert.equal(r.frame.payload.length, 1);
+  assert.equal(r.frame.payload[0], 0x00);
 });
 
 // ---- 1.2 VER 不等 ----
@@ -157,6 +178,21 @@ test('2.17 控制帧 StrmID 范围 + 语义校验', () => {
   assert.equal(parseDatagram(cf({ code: CODE.SD_SUBSCRIBE, strm_id: 0x80 }), UDP_OPT).rst.code, 0x00);
 });
 
+// ---- 2.17b 口径定案：控制帧 ACK(0x10)/GetIDL 响应(0x11) 的 StrmID=0 不判违规 ----
+test('2.17b 控制帧 ACK(0x10)/GetIDL 响应(0x11) StrmID=0 合法（不参与流绑定校验）', () => {
+  // 控制帧没有"流"概念：StrmID=0 表示不绑定流（§4.3 步骤 4 明文豁免）
+  const ack = Buffer.from([1 << 7, (TYP.ACK << 6) | 0x10, 0, 0, 0, 0, 0, 0x00]);
+  assert.equal(parseDatagram(ack, UDP_OPT).ok, true);
+  // GetIDL 响应仅 TCP（§7.2）：TCP 解析路径下 StrmID=0 合法
+  const resp = Buffer.from([1 << 7, (TYP.NON << 6) | 0x11, 0, 0, 0, 0, 0, 0x00]);
+  assert.equal(parseHeader(resp, 0, { ver: 0, isUdp: false }).state, 'ok');
+  // 反向确认：UDP 上的 GetIDL 响应必须被拒绝（传输约束，不是 StrmID 校验）
+  assert.equal(parseDatagram(resp, UDP_OPT).rst.code, 0x00);
+  // 控制帧 StrmID 范围不变：>0x7F 仍违规（0x80~0xFF 保留）
+  const bad = Buffer.from([1 << 7, (TYP.ACK << 6) | 0x10, 0, 0, 0, 0, 0, 0x80]);
+  assert.equal(parseDatagram(bad, UDP_OPT).rst.code, 0x00);
+});
+
 // ---- 2.18 数据帧 StrmID 越界 ----
 test('2.18 数据帧 StrmID=0x00 / 0xFF → RST(0x00)', () => {
   assert.equal(parseDatagram(f({ strm_id: 0 }), UDP_OPT).rst.code, 0x00);
@@ -225,6 +261,19 @@ test('§4.3 数据帧 ACK 回显非法 ID → RST(0x00)；合法 ACK 正常解�
   assert.equal(r.frame.strm_id, 0xfe);
 });
 
+// ---- §3.7/§8.1：取消确认 ACK(Code=0x00) 回显会话 StrmID ----
+test('§3.7/§8.1 取消确认 ACK(0x00) 回显会话 StrmID 正常解析；Ping 仍须 0x00', () => {
+  // CTR=1、TYP=ACK、Code=0x00、StrmID=0x05：Subscribe(TTL=0) 取消确认，
+  // 回显会话 StrmID（0x01~0x7F）属合法形态（§3.7 专项例外）
+  const ok = Buffer.from([0x80, TYP.ACK << 6, 0, 0, 0, 0, 0, 0x05]);
+  const r = parseDatagram(ok, UDP_OPT);
+  assert.equal(r.ok, true);
+  assert.equal(r.frame.strm_id, 0x05);
+  // 心跳 Ping（CTR=1、TYP=NON、Code=0x00）携带 StrmID≠0 → 仍属步骤 4 违规
+  const ping = Buffer.from([0x80, TYP.NON << 6, 0, 0, 0, 0, 0, 0x05]);
+  assert.equal(parseDatagram(ping, UDP_OPT).rst.code, 0x00);
+});
+
 // ---- 2.29 控制帧 MSK=1 ----
 test('2.29 控制帧 MSK=1 → RST(0x00)（§10 硬性约定）', () => {
   const buf = Buffer.from([(1 << 7) | (1 << 3), (TYP.NON << 6) | 0x01, 0, 0, 0, 0, 0, 0]);
@@ -264,6 +313,21 @@ test('2.1 TCP 粘包：一次接收含 3 帧全部交付', () => {
   assert.equal(got.length, 3);
   assert.equal(got[2].strm_id, 3);
   assert.equal(got[2].payload.length, 50);
+});
+
+test('轮B 粘包 1200 帧：一次 feed 全部交付且顺序/内容一致', () => {
+  const frames = [];
+  for (let i = 0; i < 1200; i++) {
+    frames.push(f({ strm_id: (i % 0xfe) + 1, payload: Buffer.from([i & 0xff]) }));
+  }
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  parser.feed(Buffer.concat(frames));
+  assert.equal(got.length, 1200); // 无丢帧
+  assert.equal(got[0].strm_id, 1);
+  assert.equal(got[1199].strm_id, ((1199 % 0xfe) + 1)); // 顺序不乱
+  assert.equal(got[1199].payload[0], 1199 & 0xff);      // 内容不错位
 });
 
 test('2.2 TCP 分包：1 帧按 1 字节/次写入正确重组', () => {
@@ -329,6 +393,169 @@ test('RST 帧形态：PLB=0 + 回显标识（§5.4）', () => {
   assert.equal(r.frame.code, RST_CODE.NOT_FOUND);
 });
 
+// ---- §4.1 违规帧定界：帧尾未到齐不得与后续帧拼接（帧走私回归） ----
+test('§4.1 违规帧帧尾未到齐时按声明长度定界（不错位/不重复回 RST）', () => {
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  const rsts = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  parser.opts.onRst = (r) => rsts.push(r);
+  // 违规帧：byte0=0x10 → VER=1 与本端 ver=0 不符；PLB=0 → 声明总长 8B
+  parser.feed(Buffer.from([0x10, 0x01]));
+  assert.equal(rsts.length, 1); // RST 只回一次
+  assert.equal(rsts[0].code, RST_CODE.UNSUPPORTED_VERSION);
+  assert.equal(got.length, 0);
+  // 补齐违规帧剩余 6B（原先实现会清空缓冲，把这 6B 当作新帧开头 → 与后续帧粘连）
+  parser.feed(Buffer.from([0x00, 0x01, 0x00, 0x01, 0x01, 0x01]));
+  assert.equal(got.length, 0); // 违规帧尾部不得被拼成"合法"帧交付
+  assert.equal(rsts.length, 1);
+  // 后续合法帧仍能正常交付（帧边界已恢复）
+  parser.feed(f({ payload: Buffer.from([9]) }));
+  assert.equal(got.length, 1);
+  assert.deepEqual([...got[0].payload], [9]);
+});
+
+// ---- §4.1 违规帧 Length 跨包：等帧头到齐后按声明总长定界 ----
+test('§4.1 违规帧 Length 跨包：帧头到齐后进入丢弃并精确收满', () => {
+  // VER=1 违规帧，payload=300 → PLB=2，帧头 10B，总长 310B
+  const bad = encodeFrame({
+    ctr: 0, typ: TYP.NON, code: CODE.REQUEST, ver: 1,
+    svc_id: 1, if_id: 1, inst_id: 1, strm_id: 1, payload: Buffer.alloc(300, 0xEE),
+  });
+  assert.equal(bad.length, 310);
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  let rstCount = 0;
+  let dropDone = 0;
+  parser.opts.onFrame = (fr) => got.push(fr);
+  parser.opts.onRst = () => { rstCount++; };
+  parser.opts.onDropComplete = () => { dropDone++; };
+  parser.feed(bad.subarray(0, 2));   // 触发 RST，等待 Length
+  assert.equal(rstCount, 1);
+  parser.feed(bad.subarray(2, 10));  // Length 到齐 → 未收满 → 丢弃模式
+  assert.equal(parser.isReceiving(), true);
+  parser.feed(bad.subarray(10));     // 余 300B 收满 → 恢复空闲
+  assert.equal(dropDone, 1);
+  assert.equal(got.length, 0);
+  assert.equal(parser.isReceiving(), false);
+  parser.feed(f({ strm_id: 2, payload: Buffer.from([7]) }));
+  assert.equal(got.length, 1);
+  assert.equal(got[0].strm_id, 2);
+});
+
+// ---- §4.1 粘包/分包混合：任意切块边界都不影响帧序与内容 ----
+test('§4.1 粘包/分包混合切块：帧序与内容正确', () => {
+  const frames = [
+    f({ strm_id: 1, payload: Buffer.from([1, 2, 3]) }),
+    f({ strm_id: 2, payload: Buffer.alloc(0) }),
+    f({ strm_id: 3, payload: Buffer.from([4, 5]) }),
+  ];
+  const all = Buffer.concat(frames);
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  const cuts = [3, 7, 17, 1, 29]; // 覆盖跨帧头/跨 Length/跨 Payload 的边界
+  let i = 0, k = 0;
+  while (i < all.length) {
+    const n = cuts[k++ % cuts.length];
+    parser.feed(all.subarray(i, Math.min(i + n, all.length)));
+    i += n;
+  }
+  assert.equal(got.length, 3);
+  assert.deepEqual(got.map((x) => x.strm_id), [1, 2, 3]);
+  assert.deepEqual([...got[0].payload], [1, 2, 3]);
+  assert.equal(got[1].payload.length, 0);
+  assert.deepEqual([...got[2].payload], [4, 5]);
+  assert.equal(parser.isReceiving(), false);
+});
+
+// ---- §4.1 大帧分片：已交付 payload 不受后续消费/压实影响 ----
+test('§4.1 大帧分片：已交付 payload 在后续压实后仍完整', () => {
+  const big = Buffer.alloc(100 * 1024);
+  for (let i = 0; i < big.length; i++) big[i] = i % 251;
+  const raw = f({ strm_id: 9, payload: big });
+  assert.equal(raw.length, 8 + 3 + big.length); // payload=102400 → PLB=3
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  for (let i = 0; i < raw.length; i += 997) {
+    parser.feed(raw.subarray(i, Math.min(i + 997, raw.length)));
+  }
+  assert.equal(got.length, 1);
+  // 继续喂入大量后续帧，触发缓冲压实/释放；已交付 payload 必须仍可读且内容正确
+  const follow = Buffer.concat(Array.from({ length: 200 }, (_, i) => f({ strm_id: (i % 200) + 1, payload: Buffer.from([i & 0xff]) })));
+  for (let i = 0; i < follow.length; i += 333) {
+    parser.feed(follow.subarray(i, Math.min(i + 333, follow.length)));
+  }
+  assert.equal(got.length, 201);
+  assert.equal(got[0].payload.length, big.length);
+  for (let i = 0; i < big.length; i += 4093) assert.equal(got[0].payload[i], i % 251);
+});
+
+// ---- §4.1 交付 payload 视图不得被后续 feed 覆写（缓冲别名回归） ----
+test('§4.1 已交付 payload 不因后续小帧复用缓冲而被覆写', () => {
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  // 首帧：小 payload，整帧由单个 chunk 承载（解析器会接管该块，交付视图指向其内存）
+  const first = f({ strm_id: 1, payload: Buffer.from([0xaa, 0xbb, 0xcc, 0xdd]) });
+  parser.feed(first);
+  assert.equal(got.length, 1);
+  const firstPayload = got[0].payload;
+  assert.deepEqual([...firstPayload], [0xaa, 0xbb, 0xcc, 0xdd]);
+  // 连续喂入 3000 个小帧（每帧独立 chunk，全部 <64KB）：若保留缓冲并写回前部，首帧视图会被改写
+  for (let i = 0; i < 3000; i++) {
+    parser.feed(f({ strm_id: (i % 0xfe) + 1, payload: Buffer.from([i & 0xff]) }));
+  }
+  assert.equal(got.length, 3001);
+  assert.deepEqual([...firstPayload], [0xaa, 0xbb, 0xcc, 0xdd]); // 首帧视图内容未被覆写
+});
+
+// ---- §5.4 半帧 RST 回显：当前帧 StrmID 必须按有效区间起点取址 ----
+test('§5.4 半帧回显 StrmID：同一缓冲已消费多帧后仍取当前帧字节', () => {
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  const a = f({ strm_id: 1, payload: Buffer.from([7]) });
+  const b = f({ strm_id: 42, payload: Buffer.from([1, 2, 3]) });
+  // 一次喂入：帧 A 完整交付（off 前移），帧 B 只给 8B（帧头含 Length 未到齐）
+  parser.feed(Buffer.concat([a, b.subarray(0, 8)]));
+  assert.equal(got.length, 1);
+  assert.equal(parser.isReceiving(), true);
+  // 若按缓冲绝对下标取 byte7，会读到帧 A 的 StrmID=1；必须读到帧 B 的 42
+  assert.equal(parser.currentStrmId(), 42);
+});
+
+// ---- §6.1/§6.3 数据帧 client(0x01~0x7F) 与 server(0x80~0xFE) 为两套独立池 ----
+test('§6.1/§6.3 数据帧 client/server 池独立（不串用）', () => {
+  const m = new StrmManager();
+  const peer = '10.0.0.1:5400';
+  // 先分配 server 池，再分配 client 池：两个角色各自从自己的池首开始
+  assert.equal(m.allocServerStream(peer, 1, 1), 0x80);
+  assert.equal(m.allocClientStream(peer, 1, 1), 0x01);
+  assert.equal(m.allocServerStream(peer, 1, 1), 0x81);
+  assert.equal(m.allocClientStream(peer, 1, 1), 0x02);
+  // 释放 client 0x01 不污染 server 池：server 继续从 0x82 分配
+  m.releaseClientStream(peer, 1, 1, 0x01);
+  assert.equal(m.allocServerStream(peer, 1, 1), 0x82);
+});
+
+// ---- §6.3 冷却优先：释放后需 ≥2 次其它分配，冷却编号优先被复用 ----
+test('§6.3 冷却编号优先复用（释放后 ≥2 次其它分配）', () => {
+  const m = new StrmManager();
+  const peer = '10.0.0.1:5400';
+  const ids = [];
+  for (let i = 0; i < 4; i++) ids.push(m.allocClientStream(peer, 1, 1));
+  assert.deepEqual(ids, [0x01, 0x02, 0x03, 0x04]);
+  // 同时释放 0x02 与 0x04（同一分配序号，二者均未冷却）
+  m.releaseClientStream(peer, 1, 1, 0x02);
+  m.releaseClientStream(peer, 1, 1, 0x04);
+  // 第 1 次分配：冷却条件均未满足（差 0 次）→ 退化为遍历到的首个非活跃编号 0x02
+  assert.equal(m.allocClientStream(peer, 1, 1), 0x02);
+  // 第 2 次分配：0x04 距释放已隔 2 次分配 → 冷却完成，优先命中 0x04（而非更早遍历到的 0x05）
+  assert.equal(m.allocClientStream(peer, 1, 1), 0x04);
+});
+
 // ---- §3.6/§6.3 REN 清理：上层传入 "ip:" 前缀也必须命中数据池与控制池 ----
 test('§3.6/§6.3 REN 按来源 IP 前缀重置 StrmID 池', () => {
   const m = new StrmManager();
@@ -342,6 +569,52 @@ test('§3.6/§6.3 REN 按来源 IP 前缀重置 StrmID 池', () => {
   assert.equal(m.allocClientStream('10.0.0.1:5400', 1, 1), 0x01); // 重置后从池首分配
   // 相似前缀节点不受影响：0x01 仍活跃 → 分配 0x02
   assert.equal(m.allocClientStream('10.0.0.10:5400', 1, 1), 0x02);
+});
+
+// ---- §10 MSK 帧别名/复用回归（mask 路径走 xor 副本，仍须验证交付后不被后续 feed 影响） ----
+test('§10 MSK 帧（全 0 密钥）交付 payload 不被后续 feed 覆写', () => {
+  const parser = new TcpStreamParser({ ver: 0 });
+  const got = [];
+  parser.opts.onFrame = (fr) => got.push(fr);
+  // 全 0 密钥是边界（§10：逐字节循环 XOR）——还原结果应等于原 payload
+  const firstRaw = encodeFrame({
+    ctr: 0, typ: TYP.NON, code: CODE.REQUEST,
+    svc_id: 1, if_id: 1, inst_id: 1, strm_id: 1,
+    msk: true, maskKey: Buffer.alloc(4, 0), payload: Buffer.from([0xaa, 0xbb, 0xcc, 0xdd]),
+  });
+  parser.feed(firstRaw);
+  assert.equal(got.length, 1);
+  const payload = got[0].payload;
+  assert.deepEqual([...payload], [0xaa, 0xbb, 0xcc, 0xdd]);
+  for (let i = 0; i < 3000; i++) {
+    parser.feed(encodeFrame({
+      ctr: 0, typ: TYP.NON, code: CODE.REQUEST,
+      svc_id: 1, if_id: 1, inst_id: 1, strm_id: (i % 0xfe) + 1,
+      msk: true, maskKey: Buffer.from([0xff, 0xff, 0xff, 0xff]), payload: Buffer.from([i & 0xff]),
+    }));
+  }
+  assert.equal(got.length, 3001);
+  assert.deepEqual([...payload], [0xaa, 0xbb, 0xcc, 0xdd]); // 全 0 密钥帧视图内容未变
+});
+
+// ---- R3-9 空闲回收：无活跃流的空闲池被回收，重建即回到初始态；活跃/未到期不回收 ----
+test('R3-9 Strm 池空闲回收：保冷却语义（只回收全空闲且已过期池）', async () => {
+  const m = new StrmManager();
+  const peer = '10.0.0.1:5400';
+  // 建池并分配一个流 → 有活跃流，任何时刻都不得回收
+  assert.equal(m.allocClientStream(peer, 1, 1), 0x01);
+  assert.equal(m.collectIdlePools(60000, '10.0.0.1:'), 0); // 有活跃流
+  // 释放后未到空闲阈值 → 不回收（冷却信息仍保留）
+  m.releaseClientStream(peer, 1, 1, 0x01);
+  assert.equal(m.collectIdlePools(60000, '10.0.0.1:'), 0);
+  // 等待超过 1ms 模拟"已空闲很久" → 回收该池
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(m.collectIdlePools(1, '10.0.0.1:'), 1);
+  // 重建池：回到初始态，从池首分配（回收发生在池完全空闲之后，不破坏冷却/序列语义）
+  assert.equal(m.allocClientStream(peer, 1, 1), 0x01);
+  // 其它对端前缀不受影响
+  assert.equal(m.allocClientStream('10.0.0.10:5400', 1, 1), 0x01);
+  assert.equal(m.collectIdlePools(1, '10.0.0.1:'), 0); // 10.0.0.1 的池刚被使用
 });
 
 // ---- §4.4 组播启发式：只覆盖 Offer/Find/REN，数据帧不得被误判 ----

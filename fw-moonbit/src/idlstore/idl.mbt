@@ -115,7 +115,14 @@ pub fn parse_idl(text : String) -> IdlDef raise IdlError {
   match obj_get(svc, "interfaces") {
     Some(Array(items)) =>
       for it in items {
-        interfaces.push(parse_interface(it, ctx))
+        let iface = parse_interface(it, ctx)
+        // §3.5/§11.1：同一服务内 IfID 必须唯一（MUST）——重复会让后一条覆盖/遮蔽前一条
+        for prev in interfaces {
+          if prev.if_id == iface.if_id {
+            raise IdlError("duplicate if_id \{iface.if_id} in service")
+          }
+        }
+        interfaces.push(iface)
       }
     _ => raise IdlError("missing service.interfaces")
   }

@@ -15,6 +15,8 @@ fn make_rpc() -> (Rpc, @strm.DataStrmPool) {
     max_payload_len: 1400,
     tcp_frame_timeout_ms: 5000L,
     heartbeat_period_ms: 30000L,
+    max_send_queue_bytes: 262144, // §12.6 背压默认
+    send_queue_budget_bytes: 67108864,
   }
   let t = @transport.Transport::new(tcfg, fn(_e) { () })
   let pool = @strm.DataStrmPool::new()

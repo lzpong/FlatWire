@@ -14,7 +14,7 @@
 pub(all) enum TcpEvent {
   TcpFrame(Frame) // §4.3 步骤 8：帧完整交付
   TcpReject(Int, FrameHeader?) // 帧头校验失败 → 回 RST(code)；hdr 用于 RST 回显归属（§5.4）
-  TcpRst26 // §4.1 半帧超时 → 回 RST(0x26)
+  TcpRst26(Int) // §4.1 半帧超时 → RST(0x26)；携带当前帧 StrmID（0=不可知，传输层仅回显 0x01~0x7F）
   TcpClose // §4.1 阶段一超时 / 丢弃模式兜底超时 → 关闭连接
 } derive(Eq, Debug)
 
@@ -244,13 +244,19 @@ pub fn TcpFrameParser::check_timeout(self : TcpFrameParser, now_ms : Int64) -> A
         }
         if !header_complete {
           // 阶段一：帧总长不可知（含 ≥8B 但 Length/Key 未收齐），无法重同步 → RST(0x26) + 关连接
-          events.push(TcpRst26)
+          // StrmID 无法确定（帧头字段可能未收齐）→ 0（不回显）
+          events.push(TcpRst26(0))
           events.push(TcpClose)
           self.state = Idle
           self.reset_frame()
         } else {
           // 阶段二：帧头完整、Payload 不完整 → RST(0x26) + 丢弃模式（连接不关闭）
-          events.push(TcpRst26)
+          // 帧头完整 → 回显当前帧 StrmID（§5.4；传输层只回显控制帧合法范围 0x01~0x7F）
+          let echo_strm = match self.hdr {
+            Some(h) => h.strm_id
+            None => 0
+          }
+          events.push(TcpRst26(echo_strm))
           match self.hdr {
             Some(h) => {
               // 帧总长 L = 8 + Length 字节数 + Key 字节数 + Payload 长度；剩余 R = L − 已收

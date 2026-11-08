@@ -102,6 +102,11 @@ export class Schema {
       if (def.output !== null && typeof def.output !== 'string') {
         throw new InvalidArgument(`interface "${iface.name}" output must be a type-name string`);
       }
+      // §3.5/§11.1：同一服务内 IfID 必须唯一（MUST）——重复会让后者静默覆盖前者，
+      // 导致接口不可达或分派到错误定义，故加载期直接拒绝
+      if (this.interfaces.has(iface.if_id)) {
+        throw new InvalidArgument(`duplicate if_id ${iface.if_id} in service "${svc.name}"`);
+      }
       this.interfaces.set(iface.if_id, def);
     }
 

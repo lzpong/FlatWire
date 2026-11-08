@@ -349,23 +349,31 @@ export class Discovery extends EventEmitter {
   onGetIdl(frame, meta, conn) {
     const entry = decodeGetIdlEntry(frame.payload);
     if (!entry || entry.svc_id === 0) {
-      // Payload ≠3B 或 SvcID=0 → RST(0x20)（§7.2）
-      conn.write(makeRst(RST_CODE.BAD_REQUEST, { ctr: 1, strm_id: frame.strm_id }));
+      // Payload ≠3B 或 SvcID=0 → RST(0x20)（§7.2）；RST 为控制帧直写（≤1024B，不占发送配额）
+      if (!conn.write(makeRst(RST_CODE.BAD_REQUEST, { ctr: 1, strm_id: frame.strm_id }))) {
+        this.log.debug('sd', `GetIDL RST tx skipped (connection closed): ${conn.addrKey}`);
+      }
       return;
     }
     // 服务端匹配 = 本地 IDL 库已加载定义（与实例是否在线无关，§7.2）
     const def = this.idlStore.get(entry.svc_id, entry.major_ver);
     if (!def) {
-      conn.write(makeRst(RST_CODE.NOT_FOUND, { ctr: 1, strm_id: frame.strm_id }));
+      if (!conn.write(makeRst(RST_CODE.NOT_FOUND, { ctr: 1, strm_id: frame.strm_id }))) {
+        this.log.debug('sd', `GetIDL RST tx skipped (connection closed): ${conn.addrKey}`);
+      }
       this.log.frame('warn', { svc_id: entry.svc_id, dir: 'Tx', addr: conn.addrKey, code: RST_CODE.NOT_FOUND, msg: 'GetIDL: no such (SvcID, MajorVer) loaded' });
       return;
     }
     // 响应：CTR=1, TYP=NON, Code=0x11, 回显请求 StrmID, Payload=IDL JSON 全文（§7.2）
-    conn.write({
+    // 体积可达数十 KB → 超过控制帧直写阈值，按数据帧入队并受发送上限约束（§12.6）。
+    // write=false = 帧未写入任何字节（队列满/连接失效）；TCP 无重传，丢弃后由客户端查询超时兜底。
+    if (!conn.write({
       ctr: 1, typ: TYP.NON, code: CODE.SD_GET_IDL_RESP,
       svc_id: 0, if_id: 0, inst_id: 0, strm_id: frame.strm_id,
       payload: Buffer.from(def.jsonText, 'utf8'),
-    });
+    })) {
+      this.log.warn('sd', `GetIDL response dropped (send queue full/conn closed): svc=${entry.svc_id} v${entry.major_ver} strm=${frame.strm_id}`);
+    }
   }
 
   // ============================================================
@@ -767,7 +775,13 @@ export class Discovery extends EventEmitter {
       const waiter = { resolve, reject: (e) => { clearTimeout(timer); reject(e); }, timer };
       this.pendingIdl.set(idx, waiter);
     });
-    conn.write(frame);
+    // 发送背压（§12.6）：GetIDL 请求帧仅 11B（控制帧直写，不占配额），write=false 只可能是
+    // 连接已失效（帧未写入）。失败时先拒绝等待器（清查询定时器），随后由下方 finally 回收
+    // pendingIdl 记录与控制 StrmID，查询失败上抛给调用方（§7.2：由应用决定重试）。
+    if (!conn.write(frame)) {
+      const waiter = this.pendingIdl.get(idx);
+      if (waiter) waiter.reject(new GetIdlError(`GetIDL send failed (connection closed) svc=${svcId} v${majorVer}`));
+    }
     try {
       const jsonText = await p;
       // 响应校验：IDL 自含 svc_id/major_ver 须与请求一致（§7.2，落盘前校验）

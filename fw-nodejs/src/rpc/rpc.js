@@ -89,10 +89,16 @@ export class RpcModule extends EventEmitter {
       if (iface.transport === 'tcp') {
         // TCP：TYP=NON，协议栈不重传（§5.1/§3.7）
         const conn = await this.ctx.getTcpConn(rec.addr.address, rec.addr.port);
-        conn.write({
+        // 发送背压（§12.6）：write 返回 false = 本帧未写入任何字节（发送队列满 / 连接失效）。
+        // 必须回滚：抛错由下方 catch → finish(err) 删除 _pending 等待记录、取消重传并释放 StrmID，
+        // 不能让请求丢失却继续占用 StrmID。
+        if (!conn.write({
           ctr: 0, typ: TYP.NON, code: CODE.REQUEST,
           svc_id: svcId, if_id: ifId, inst_id: instId, strm_id: strm, payload: body,
-        });
+        })) {
+          this.log.warn('rpc', `tcp call tx rejected (send queue full/conn closed), rollback: svc=${svcId} if=0x${ifId.toString(16)} strm=${strm} peer=${peer}`);
+          throw new FwError(`tcp send queue full: call svc=${svcId} if=0x${ifId.toString(16)} (strm=${strm} rolled back)`);
+        }
       } else {
         // UDP：TYP=CON，首发 t=0 + 重传表（200/600/1400ms，3000ms 静默停止，§5.5）
         const raw = encodeFrame({
@@ -120,12 +126,22 @@ export class RpcModule extends EventEmitter {
 
     if (iface.transport === 'tcp') {
       // TCP：TYP=NON（§5.2），发完即释放（传输可靠性由 TCP 保证）
-      const conn = await this.ctx.getTcpConn(rec.addr.address, rec.addr.port);
-      conn.write({
-        ctr: 0, typ: TYP.NON, code: CODE.FIRE_FORGET,
-        svc_id: svcId, if_id: ifId, inst_id: instId, strm_id: strm, payload: body,
-      });
-      this.strm.releaseClientStream(peer, svcId, instId, strm);
+      // 发送背压（§12.6）：TCP 无重传、无 pending 记录；write=false 表示帧未写入任何字节。
+      // 无论建连或写入成败，finally 都释放 StrmID，避免「请求没发出去却占着槽」。
+      let ok = false;
+      try {
+        const conn = await this.ctx.getTcpConn(rec.addr.address, rec.addr.port);
+        ok = conn.write({
+          ctr: 0, typ: TYP.NON, code: CODE.FIRE_FORGET,
+          svc_id: svcId, if_id: ifId, inst_id: instId, strm_id: strm, payload: body,
+        });
+      } finally {
+        this.strm.releaseClientStream(peer, svcId, instId, strm);
+      }
+      if (!ok) {
+        this.log.warn('rpc', `tcp fire_forget tx rejected (send queue full/conn closed), released: svc=${svcId} if=0x${ifId.toString(16)} strm=${strm} peer=${peer}`);
+        throw new FwError(`tcp send queue full: fire_forget svc=${svcId} if=0x${ifId.toString(16)} (strm=${strm} released)`);
+      }
       return;
     }
     // UDP：TYP=CON（§5.2），等传输层 ACK；无应用层超时，重传耗尽静默停止（§5.5）
@@ -354,7 +370,11 @@ export class RpcModule extends EventEmitter {
           sendFn(respRaw);
           this._retrans.start(key, respRaw, sendFn);
         } else {
-          meta.conn.write(respFrame); // TCP Response：TYP=NON（§5.1）
+          // TCP Response：TYP=NON（§5.1）。write=false = 帧未写入任何字节（发送队列满/连接失效）；
+          // TCP 无响应重传（§3.7/§5.1），丢弃本响应后由客户端应用层响应超时兜底，此处仅计数 + 日志。
+          if (!meta.conn.write(respFrame)) {
+            this.log.warn('rpc', `tcp response dropped (send queue full/conn closed): svc=${frame.svc_id} inst=${frame.inst_id} strm=${frame.strm_id}`);
+          }
         }
         this.log.frame('debug', {
           svc_id: frame.svc_id, if_id: frame.if_id, inst_id: frame.inst_id, strm_id: frame.strm_id,
@@ -373,7 +393,10 @@ export class RpcModule extends EventEmitter {
   _sendRst(code, echo, meta) {
     const rst = makeRst(code, echo);
     if (meta.transport === 'tcp') {
-      meta.conn.write(rst);
+      // RST 为控制帧（≤1024B 直写，不占发送配额）；false 仅表示连接已失效 → 记录日志后放弃（不重试）
+      if (!meta.conn.write(rst)) {
+        this.log.warn('rpc', `tcp RST tx skipped (connection closed): code=0x${code.toString(16)} strm=${echo.strm_id}`);
+      }
     } else {
       this.ctx.sendUdpFrame(rst, meta.address, meta.port, 'main');
     }

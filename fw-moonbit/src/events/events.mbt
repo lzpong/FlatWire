@@ -176,7 +176,13 @@ fn Events::push_one(
           }
         }
         let spec = @frame.data_spec(@frame.Non, 0x03, svc_id, if_id, inst_id, strm)
-        let _ = self.transport.send_tcp_frame(cid, spec, payload)
+        // §12.6：TCP 数据帧被拒（队列满，未写入）→ 计数日志后丢弃（§8.2 断连暂停不补发语义，
+        // 该条事件丢失由应用侧下一次取用/通知兜底）；NON 发送完成即 Closed → 仍释放 StrmID
+        if !self.transport.send_tcp_frame(cid, spec, payload) {
+          ev_log_error(
+            "[events] tcp-event 推送未写入（队列满或连接失效）: peer=\{s.peer} svc=\{svc_id} if=\{if_id}",
+          )
+        }
         // §6.2：NON Notification 发送完成即 Closed
         self.data_pool.release(s.peer, svc_id, inst_id, strm)
       }

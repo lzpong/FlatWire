@@ -166,6 +166,26 @@ int suite_schema(void) {
   }
   TEST_END();
 
+  TEST_BEGIN("§3.5/§11.1 IfID 在同一服务内必须唯一（重复 → 加载失败）");
+  {
+    const char *dup =
+      "{\"service\":{\"name\":\"D\",\"svc_id\":4098,\"major_ver\":1,\"minor_ver\":0,"
+      "\"interfaces\":[{\"name\":\"A\",\"if_id\":7,\"type\":\"ff\",\"transport\":\"tcp\",\"input\":[]},"
+      "{\"name\":\"B\",\"if_id\":7,\"type\":\"ff\",\"transport\":\"tcp\",\"input\":[]}]}}";
+    fw_schema_t *ds = build_text(dup, err, sizeof(err));
+    CHECK(ds == NULL);
+    CHECK(strstr(err, "unique") != NULL);
+    // 唯一 IfID 的等价 IDL 正常加载（确保校验不误伤）
+    const char *uniq =
+      "{\"service\":{\"name\":\"D\",\"svc_id\":4098,\"major_ver\":1,\"minor_ver\":0,"
+      "\"interfaces\":[{\"name\":\"A\",\"if_id\":7,\"type\":\"ff\",\"transport\":\"tcp\",\"input\":[]},"
+      "{\"name\":\"B\",\"if_id\":8,\"type\":\"ff\",\"transport\":\"tcp\",\"input\":[]}]}}";
+    fw_schema_t *us = build_text(uniq, err, sizeof(err));
+    CHECK(us != NULL);
+    fw_schema_free(us);
+  }
+  TEST_END();
+
   TEST_BEGIN("v5.0 拒绝 optional / size / width（§11.1）");
   const char *legacy_fields[] = {
     "{\"name\":\"x\",\"type\":\"string\",\"max_len\":8,\"optional\":true}",

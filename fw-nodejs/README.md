@@ -9,7 +9,7 @@ FlatWire Protocol v5.0 车辆软件 RPC/事件推送协议栈的 Node.js 参考�
 ## 运行
 
 ```powershell
-# 单元测试（71 项：codec / frame / transport / sd-rpc）
+# 单元测试（99 项：codec / frame / transport / sd-rpc）
 npm test
 
 # 示例（两个终端分别运行；NodeB 空 IDL 库起步，自动 GetIDL 落盘后调用成功）
@@ -95,6 +95,8 @@ fw-nodejs/
 | `tcp_enabled` | true | TCP 监听开关（同机双栈演示时客户端角色栈关闭） |
 | `bind_address` / `multicast_interface` | 空（全接口/系统选路） | 绑定地址与组播出口接口（多网卡/同机演示用） |
 | `log_level` | info | debug/info/warn/error |
+| `max_send_queue_bytes` | 262144 | **发送背压（§12.6 实现限制）**：单连接数据帧未发字节上限；0=不限制 |
+| `send_queue_budget_bytes` | 67108864 | **发送背压**：全栈所有连接数据帧未发字节总预算；0=不限制（非 0 时须 ≥ 单连接上限） |
 
 ## 有意偏差与实现裁定
 
@@ -108,14 +110,15 @@ fw-nodejs/
 6. **Subscribe 单 Entry RST(0x24) 调和**（6.17/6.19）：单 Entry 帧指向本地完全不存在 (svc,inst) → RST(0x24)；多 Entry 帧逐 Entry 丢弃仍回确认（§7.2 Entry 级处理）。
 7. **自我回环过滤**：指定 `bind_address` 时按该地址过滤本 socket 回环帧；未指定时按全部本机 IPv4 地址。同机双栈演示利用 127/8 多回环地址（A=127.0.0.1 / B=127.0.0.2）+ 共用端口避免 Windows 同端口单播投递竞争。
 8. **接口级 `crc` 字段**：IDL 接口可声明 `"crc": true` 启用接口级 CRC（§9.6「CRC 作为服务契约约定」的实现落点）；省略 = 不启用。
+9. **发送背压与 `TcpConn.write` 语义收紧**（§12.6 实现限制，非协议语义）：数据帧（帧总长 >1024B 或 CTR=0）写入前检查单连接水位（`socket.writableLength`）与全栈预算，满则**不调用 `socket.write`、不写入任何字节**并返回 `false`；控制帧（RST/Ping/GetIDL 请求，CTR=1 且总长 ≤1024B）直写不入队、不占配额。**注意：这与旧实现不同**——旧实现直接返回 `socket.write()` 的 boolean（`false` 仅表示缓冲超过 highWaterMark，帧仍被写入）。调用方必须把 `false` 当作「未写入」处理：rpc 客户端请求回滚 `_pending` 与 StrmID，`fire_forget` 释放 StrmID，其余推送/响应按丢弃 + 计数 + 日志处理。队列自首次拒写起持续满 ≥ 2×`heartbeat_period_ms` 则断连。观测量（`TcpConn.qBytes/qPeak/qRejects`、`TcpTransport.sendqPeak/sendqRejects/sendqClosedFull`）本轮仅内部统计 + 日志，未提供公开 API。
 
 ## 测试
 
-`npm test` 运行 71 项单元测试（`node:test`，对齐《Test Cases.v5.md》用例编号）：
+`npm test` 运行 99 项单元测试（`node:test`，对齐《Test Cases.v5.md》用例编号）：
 
-- **codec（31）**：CRC 自检值 0x29B1、§1 裸字节编解码（1.5~1.38：强制长度声明/bool 严格/恒定宽度/值域/float/timestamp/前缀宽度/定长与变长/嵌套/enum/CRC 缺省与开启/末尾字段忽略/大端）、MSK-XOR
-- **frame（22）**：§4.3 解析矩阵（非法组合 → 正确 RST Code）、RST 回显形态
-- **transport（8）**：TCP 粘包/分包/跨包、半帧两阶段全场景（精确丢弃/恢复/EOF/反向 RST 不污染正向流）
-- **sd-rpc（10）**：重传时间线 200/600/1400ms、响应缓存去重、双栈真实回环集成（发现/GetIDL 拉取落盘/调用往返/订阅确认链路/事件推送/全量推送/取消确认/REN 清缓存）
+- **codec（32）**：CRC 自检值 0x29B1、§1 裸字节编解码（1.5~1.38：强制长度声明/bool 严格/恒定宽度/值域/float/timestamp/前缀宽度/定长与变长/嵌套/enum/CRC 缺省与开启/末尾字段忽略/大端）、MSK-XOR
+- **frame（42）**：§4.3 解析矩阵（非法组合 → 正确 RST Code）、RST 回显形态、TCP 流式粘包/分包/半帧两阶段/丢弃模式兜底（含 1200 帧粘包、MSK 帧、大帧分片）
+- **transport（14）**：TCP 粘包/分包/跨包、半帧两阶段全场景（精确丢弃/恢复/EOF/反向 RST 不污染正向流）、心跳超时临界、连接上限与句柄回收、**发送背压 BP-1/BP-2（真实 socket 拥塞：对端不读 + 大帧）**
+- **sd-rpc（11）**：重传时间线 200/600/1400ms、响应缓存去重、双栈真实回环集成（发现/GetIDL 拉取落盘/调用往返/订阅确认链路/事件推送/全量推送/取消确认/REN 清缓存）、**BP-3 写失败回滚（call 清 pending + 释放 StrmID；fire_forget 释放 StrmID）**
 
 集成冒烟（`examples/` 双进程真实回环）已验证：发现 → 空 IDL 库自动 GetIDL 落盘 → rpc 往返（含 fixed_len=20 定长串与 max_len 变长串）→ fire_forget → 订阅确认 ACK(0x10) → 全量推送/实时推送 → 服务端优雅退出（REN×3）→ 客户端感知缓存清空 → 服务端重启后重新发现。

@@ -14,8 +14,11 @@ $env:Path = "C:\Users\Ong\.moon\bin;$env:Path"   # moon 不在默认 PATH 时
 
 cd implementations\fw-moonbit
 
-# 运行全部单元测试（117 用例；必须显式指定 js 目标——extern "js" 不支持默认 wasm 后端）
+# 运行全部单元测试（132 用例；必须显式指定 js 目标——extern "js" 不支持默认 wasm 后端）
 moon test --target js
+
+# 发送背压实测（§12.6；真实 socket 拥塞：本进程起黑洞服务端 pause 不读 + 持续写大帧）
+moon run examples/bp_probe --target js
 
 # 构建示例（产物位于 _build\js\debug\build\examples\...）
 moon build --target js
@@ -69,6 +72,7 @@ examples/
   node_a/    服务端示例：注册 VehicleStateService（4096 v1），提供
              GetState/UpdateState/UploadBlob 接口与 StateChanges 事件
   node_b/    客户端示例：发现 → GetIDL → call/ff → 订阅 → REN 感知（冒烟主脚本）
+  bp_probe/  发送背压实测（§12.6：真实 socket 拥塞 → 拒写不写入 / 控制帧直写 / 持续满断连）
 ```
 
 ## FFI 边界（仅 js 后端）
@@ -120,6 +124,16 @@ MoonBit 与 Node.js 的边界位于各模块 `*_ffi.mbt`，通过 `extern "js"` 
 5. **UDP 应答帧 socket 固定**：服务端角色的应答帧（Offer、Subscribe 确认、SD RST、
    FF ACK、事件 UDP 推送）恒走 server socket（源端口 = fw_udp_port），保证对端
    发现缓存记录正确实例地址（§2）；客户端主动请求帧走 client socket。
+6. **TCP 发送背压（§12.6 实现限制，非协议语义）**：数据帧发送队列有界
+   （`max_send_queue_bytes` 默认 256KB/连接、`send_queue_budget_bytes` 默认 64MB/全栈）；
+   控制帧（CTR=1 且帧总长 ≤1024B）直写不入队；`Transport::send_tcp_frame` 的 Bool
+   **签名不变、语义扩展为「写入/入队成功」**（`false` = 本帧一字节未写：队列满或连接失效），
+   调用方按返回值回滚/重试；队列自首次拒写起持续满 ≥2×`heartbeat_period_ms` 断连。
+   全栈预算判定为 **O(1) 增量计数**（`__fw.q.used`：数据帧入队加 / drain 归还 / 关闭扣减残留），
+   不再遍历所有连接求和；记账与控制帧分桶（判定只用数据桶，控制帧不占配额），
+   `__fw.q.check` 开启后每次记账变更与遍历求和对账（漂移抛错，见 `examples/bp_probe`）。
+   水位来源仍以 `socket.writableLength` 计算（含控制帧直写字节，与 C 的独立队列计数不同；
+   差异与统一判断见设计 §12.6）。
 
 ## 依赖
 

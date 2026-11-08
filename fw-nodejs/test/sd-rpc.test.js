@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import dgram from 'node:dgram';
 import { RetransmitTable } from '../src/rpc/retransmit.js';
+import { RpcModule } from '../src/rpc/rpc.js';
+import { StrmManager } from '../src/strm.js';
 import { FwStack } from '../src/stack.js';
 import { TYP, CODE, encodeFrame, parseDatagram } from '../src/frame/frame.js';
 
@@ -210,4 +212,40 @@ test('REN：A 重启（stop 发 REN×3）后 B 清空该源发现缓存（§3.6�
 
 test('teardown：停止 B 栈', async () => {
   await stackB.stop();
+});
+
+// ============================================================
+// 发送背压（§12.6 实现限制）——rpc 写失败回滚语义。
+// 传输层真实 socket 拥塞路径已在 transport.test.js 的 BP-1/BP-2 验证；
+// 此处以 stub conn.write=false（等价「队列满且未写入」）验证两处关键调用点的回滚。
+// ============================================================
+
+test('BP-3(Node) rpc TCP 写失败：call 回滚 pending + 释放 StrmID；fire_forget 释放 StrmID', async () => {
+  const strm = new StrmManager();
+  const schema = {
+    majorVer: 1,
+    getInterface: (id) => (id === 0x02
+      ? { if_id: 0x02, type: 'ff', transport: 'tcp' }
+      : { if_id: id, type: 'rpc', transport: 'tcp' }),
+    encodePayload: () => Buffer.alloc(4),
+  };
+  const peer = '127.0.0.1:9000';
+  const rpc = new RpcModule({
+    config: { response_timeout_ms: 300, retransmit_interval_ms: 200, retransmit_max: 3 },
+    log: { info() {}, warn() {}, error() {}, frame() {}, debug() {} },
+    strm,
+    idlStore: { get: () => ({ schema }) },
+    discovery: { getDiscovered: () => ({ addr: { address: '127.0.0.1', port: 9000 }, major_ver: 1 }) },
+    getTcpConn: async () => ({ write: () => false }), // false = 本帧未写入任何字节（队列满）
+  });
+  const poolKey = `${peer}|4096|1|1`; // client 数据池（base=0x01）
+
+  // call：必须失败，且不残留 _pending / 活跃 StrmID（否则请求丢失却占着槽）
+  await assert.rejects(() => rpc.call_async(4096, 1, 0x01, { x: 1 }), /send queue full/);
+  assert.equal(rpc._pending.size, 0, 'call 写失败后 _pending 未清理');
+  assert.equal(strm._dataPools.get(poolKey).activeCount, 0, 'call 写失败后 StrmID 未释放');
+
+  // fire_forget：同样必须释放 StrmID 并上抛
+  await assert.rejects(() => rpc.fire_forget(4096, 1, 0x02, { x: 1 }), /send queue full/);
+  assert.equal(strm._dataPools.get(poolKey).activeCount, 0, 'fire_forget 写失败后 StrmID 未释放');
 });

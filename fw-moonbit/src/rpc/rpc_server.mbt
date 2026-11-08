@@ -30,6 +30,7 @@ fn is_tcp_conn(conn_id : Int) -> Bool {
 }
 
 /// 服务端发送（TCP → 连接定向；UDP → server socket 单播到请求源地址）
+/// 返回值语义同 Transport::send_tcp_frame（§12.6）：true = 已写入/已入队，false = 未写入
 fn Rpc::serve_send(
   self : Rpc,
   spec : @frame.FrameSpec,
@@ -54,13 +55,17 @@ fn Rpc::serve_rst(
   port : Int,
   conn_id : Int
 ) -> Unit {
-  let _ = self.serve_send(
+  let ok = self.serve_send(
     @frame.data_spec(@frame.Rst, code, f.svc_id, f.if_id, f.inst_id, f.strm_id),
     b"",
     host,
     port,
     conn_id,
   )
+  // §12.6：RST 为控制帧直写，写失败仅意味着连接已不可用 → 记录日志后放弃
+  if !ok {
+    rp_log_error("[rpc] RST 未写入（连接失效）: code=\{code} conn=\{conn_id}")
+  }
 }
 
 /// 处理 Request（§5.1：UDP=CON / TCP=NON；Response 回显 StrmID，形态随请求传输）
@@ -123,7 +128,13 @@ fn Rpc::serve_request(
         f.strm_id, // 回显请求 StrmID（§5.1）
       )
       if tcp {
-        let _ = self.transport.send_tcp_frame(conn_id, spec, resp)
+        // §12.6：TCP Response 无重传；数据帧被拒（队列满，未写入）→ 丢弃 + 日志，
+        // 由客户端响应超时兜底（不伪造成功，也不阻塞服务端）
+        if !self.transport.send_tcp_frame(conn_id, spec, resp) {
+          rp_log_error(
+            "[rpc] TCP Response 未写入（队列满或连接失效）: svc=\{f.svc_id} if=\{f.if_id} peer=\{host}",
+          )
+        }
       } else {
         // UDP：缓存响应进重传链（§5.5 CON 均走重传；随 ACK/RST/耗尽清除）
         let c : CachedResp = {

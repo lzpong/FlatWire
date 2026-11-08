@@ -29,6 +29,7 @@ export class StrmPool {
     this.active = new Set();     // 当前活跃的 StrmID
     this.releaseSeq = new Map(); // strmId → 释放时的全局分配序号（冷却判定）
     this.allocSeq = 0;           // 全局分配序号（每次成功分配 +1）
+    this.lastUsedMs = 0;         // 最近一次分配/释放时刻（R3-9 空闲回收判定）
   }
 
   /**
@@ -38,6 +39,7 @@ export class StrmPool {
    * @returns {number|null}
    */
   alloc() {
+    this.lastUsedMs = Date.now(); // R3-9：刷新池活跃时刻
     // 第一轮：优先已冷却的非活跃编号
     let fallback = null;
     for (let i = 0; i < this.size; i++) {
@@ -63,6 +65,7 @@ export class StrmPool {
 
   /** 释放（进入冷却：记录释放序号供冷却判定） */
   release(id) {
+    this.lastUsedMs = Date.now(); // R3-9：刷新池活跃时刻
     if (this.active.delete(id)) {
       this.releaseSeq.set(id, this.allocSeq);
     }
@@ -88,13 +91,16 @@ export class StrmPool {
  */
 export class StrmManager {
   constructor() {
-    // 数据帧池：key = `${peer}|${svc}|${inst}`，client(0x01~0x7F)/server(0x80~0xFE) 独立
+    // 数据帧池：key = `${peer}|${svc}|${inst}|${base}`，client(0x01~0x7F)/server(0x80~0xFE) 各 127 个独立池
     this._dataPools = new Map();
     // 控制帧统一池（订阅会话 + GetIDL 查询）：key = peer（§3.5/§6.3）
     this._ctrlPools = new Map();
   }
 
-  _dataKey(peer, svcId, instId) { return `${peer}|${svcId}|${instId}`; }
+  // 池键必须带角色基址：client(0x01~0x7F) 与 server(0x80~0xFE) 是**两套独立 127 池**（§6.1/§6.3）。
+  // 若键只含 (peer,svc,inst)，先分配的 server 池（base=0x80）会被随后的 client 分配复用，
+  // 导致 client 拿到 0x80+ 的 StrmID（越出 0x01~0x7F 范围）且两个角色互相耗尽/释放对方的流。
+  _dataKey(peer, svcId, instId, base) { return `${peer}|${svcId}|${instId}|${base}`; }
 
   /** 数据帧客户端流分配（Request/FF 发起，§6.1） */
   allocClientStream(peer, svcId, instId) {
@@ -147,12 +153,41 @@ export class StrmManager {
   }
 
   _dataPool(peer, svcId, instId, base) {
-    const key = this._dataKey(peer, svcId, instId);
+    const key = this._dataKey(peer, svcId, instId, base);
     let pool = this._dataPools.get(key);
     if (!pool) {
       pool = new StrmPool(base, base + 0x7e); // 127 个：0x01~0x7F 或 0x80~0xFE
+      pool.lastUsedMs = Date.now();
       this._dataPools.set(key, pool);
     }
     return pool;
+  }
+
+  /**
+   * R3-9：回收空闲池。peer 前缀为空时回收全部空闲池；否则仅回收该对端的池。
+   * 仅当池内无活跃 StrmID 且距最近一次分配/释放超过 idleMs 才回收（保留冷却/序列语义——
+   * 回收的池已经空闲，重新请求时新建池即回到初始状态，与 §6.3 一致）。
+   * @param {number} idleMs 空闲阈值（毫秒）
+   * @param {string} [peerPrefix] 对端前缀（"ip:" 或 "ip:port"）；省略回收全部
+   * @returns {number} 回收的池数
+   */
+  collectIdlePools(idleMs, peerPrefix) {
+    const now = Date.now();
+    const cutoff = now - idleMs;
+    let removed = 0;
+    const match = (key) => peerPrefix === undefined || peerPrefix === null || key.startsWith(peerPrefix);
+    for (const [key, pool] of this._dataPools) {
+      if (match(key) && pool.activeCount === 0 && pool.lastUsedMs <= cutoff) {
+        this._dataPools.delete(key);
+        removed++;
+      }
+    }
+    for (const [key, pool] of this._ctrlPools) {
+      if (match(key) && pool.activeCount === 0 && pool.lastUsedMs <= cutoff) {
+        this._ctrlPools.delete(key);
+        removed++;
+      }
+    }
+    return removed;
   }
 }

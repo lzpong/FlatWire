@@ -77,8 +77,11 @@ static void push_to_one(fw_stack_t *st, const fw_sub_rec_t *sub, uint16_t svc_id
       fw_log(FW_LOG_WARN, "events", "tcp-event push paused (no connection from %s)", sub->peer_ip);
       return;
     }
-    fw_tcp_send_frame(st, c, &d); // TYP=NON（TCP 全 NON，§5.3）
+    int rc = fw_tcp_send_frame(st, c, &d); // TYP=NON（TCP 全 NON，§5.3）
     fw_strm_release_server(st->strm, peer, svc_id, inst_id, strm); // TCP 自带可靠性，发完即释放
+    if (rc != FW_OK)
+      // 发送队列满：本次推送未入队（事件语义为状态推送，后续 notify 会覆盖，不重排队）
+      fw_log(FW_LOG_WARN, "events", "tcp-event push rejected (rc=%d), strm=%d peer=%s", rc, strm, peer);
     return;
   }
   if (iface->reliable) {

@@ -40,6 +40,10 @@ void fw_config_defaults(fw_config_t *cfg) {
   cfg->tcp_frame_timeout_ms = 5000;
   cfg->heartbeat_period_ms = 30000;
   cfg->max_payload_len = 1400;
+  cfg->max_conns = 1024; // R3-8：默认给足，正常使用不受影响
+  cfg->max_send_queue_bytes = 262144;   // 256KB/连接（实现限制，非协议语义）
+  cfg->send_queue_budget_bytes = 67108864; // 64MB 全栈预算（实现限制）
+  cfg->strm_pool_idle_ms = 300000; // R3-9：默认 5 分钟无活跃流即回收池
   cfg->ver = 0;
   cfg->idl_dir = "./idl";
   cfg->tcp_enabled = 1;
@@ -70,6 +74,22 @@ int fw_config_validate(const fw_config_t *cfg, char *err, int errsz) {
   }
   if (cfg->max_payload_len == 0) {
     snprintf(err, (size_t)errsz, "max_payload_len must be > 0");
+    return FW_ERR_CONFIG;
+  }
+  if (cfg->max_conns == 0) {
+    snprintf(err, (size_t)errsz, "max_conns must be > 0 (R3-8 connection limit)");
+    return FW_ERR_CONFIG;
+  }
+  // 发送背压（实现限制，非协议语义）：0=不限制；非 0 时给出最小值与预算一致性约束
+  if (cfg->max_send_queue_bytes && cfg->max_send_queue_bytes < 1024) {
+    snprintf(err, (size_t)errsz, "max_send_queue_bytes must be 0 (unlimited) or >= 1024");
+    return FW_ERR_CONFIG;
+  }
+  if (cfg->send_queue_budget_bytes && cfg->max_send_queue_bytes &&
+      cfg->send_queue_budget_bytes < cfg->max_send_queue_bytes) {
+    snprintf(err, (size_t)errsz,
+             "send_queue_budget_bytes(%u) must be >= max_send_queue_bytes(%u) or 0",
+             cfg->send_queue_budget_bytes, cfg->max_send_queue_bytes);
     return FW_ERR_CONFIG;
   }
   if (cfg->retransmit_max < 0 || cfg->retransmit_max > 20) {
@@ -304,6 +324,8 @@ void fw_stack_free(fw_stack_t *st) {
   fw_strm_free(st->strm);
   fw_idl_free(st->idl);
   free(st->conns);
+  free(st->pollfds); // R3-C：动态 pollfd 集缓存
+  free(st->pollidx);
   free(st);
 }
 
@@ -311,9 +333,21 @@ void fw_stack_free(fw_stack_t *st) {
 
 int fw_stack_poll(fw_stack_t *st, int timeout_ms) {
   if (!st->started) return FW_ERR_STATE;
-  // 构造 pollfd 集（每轮重建；连接数少，开销可忽略）
-  struct pollfd fds[280];
-  int idx[280];
+  // 构造 pollfd 集（每轮重建；容量按连接数动态扩容并缓存，R3-C）
+  int need = 3 + st->nconn; // 3 = 两个 UDP socket + TCP 监听
+  if (need > st->pollcap) {
+    int nc = st->pollcap ? st->pollcap : 64;
+    while (nc < need) nc *= 2;
+    struct pollfd *nf = (struct pollfd *)realloc(st->pollfds, (size_t)nc * sizeof(struct pollfd));
+    if (!nf) return FW_ERR_MEMORY; // 原缓冲仍有效（realloc 失败不动原指针）
+    st->pollfds = nf;
+    int *ni = (int *)realloc(st->pollidx, (size_t)nc * sizeof(int));
+    if (!ni) return FW_ERR_MEMORY;
+    st->pollidx = ni;
+    st->pollcap = nc;
+  }
+  struct pollfd *fds = (struct pollfd *)st->pollfds;
+  int *idx = st->pollidx;
   int n = 0;
   if (st->udp_main != FW_FD_INVALID) {
     fds[n].fd = st->udp_main; fds[n].events = POLLIN; fds[n].revents = 0; idx[n++] = -1;
@@ -324,7 +358,7 @@ int fw_stack_poll(fw_stack_t *st, int timeout_ms) {
   if (st->tcp_listen != FW_FD_INVALID) {
     fds[n].fd = st->tcp_listen; fds[n].events = POLLIN; fds[n].revents = 0; idx[n++] = -3;
   }
-  for (int i = 0; i < st->nconn && n < 279; i++) {
+  for (int i = 0; i < st->nconn && n < st->pollcap; i++) { // R3-C：动态容量，不再截断 280
     fw_tcpconn_t *c = st->conns[i];
     if (!c || c->closed) continue;
     short ev = POLLIN;
@@ -363,6 +397,12 @@ int fw_stack_poll(fw_stack_t *st, int timeout_ms) {
   fw_rpc_tick(st, now);           // 响应超时（§1.3）/ff 兜底/缓存过期
   fw_events_tick(st, now);        // 推送兜底/接收记录清理
   fw_tcp_tick(st, now);           // 半帧两阶段 + 心跳（§4.1/§5.7）
+  // R3-9：Strm 池空闲回收（每 10s 扫描一次；仅回收无活跃流的空闲池，不影响冷却/序列）
+  if (now - st->last_strm_sweep_ms >= 10000) {
+    st->last_strm_sweep_ms = now;
+    int swept = fw_strm_sweep(st->strm, now, st->cfg.strm_pool_idle_ms);
+    if (swept > 0) fw_log(FW_LOG_DEBUG, "strm", "reclaimed %d idle pool(s)", swept);
+  }
   fw_tcp_flush_all(st);           // POLLOUT 就绪的发送缓冲
   return FW_OK;
 }
@@ -522,6 +562,9 @@ int fw_unregister_service(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id) {
 }
 
 // notify（§13.1）：更新接口缓存并推送给所有订阅者（§8.1/§8.2）
+// 返回值语义（实现限制，非协议语义）：FW_OK 表示「已受理并尝试推送」，不保证每个订阅者
+// 的 TCP 帧都已入队——推送帧若因发送队列满被拒（FW_ERR_WOULDBLOCK），仅记录日志并计入
+// fw_stats_sendq().rejects，不影响本函数返回值（订阅者按 §8.2 的 TTL/保活语义自行恢复）。
 int fw_notify(fw_stack_t *st, uint16_t svc_id, uint8_t inst_id, uint16_t if_id, fw_value_t *payload) {
   if (!st || !st->started) { fw_value_free(payload); return FW_ERR_STATE; }
   st->last_err.code = FW_OK;

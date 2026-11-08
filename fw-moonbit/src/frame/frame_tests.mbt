@@ -102,6 +102,45 @@ test "frame without mask roundtrip" {
   }
 }
 
+/// MSK 别名/复用回归：同一 payload + 全 0 密钥重复编码
+/// 全 0 密钥下 XOR 不改变字节，是"编码就地改写输入"最易暴露的路径；
+/// 复用的 payload 不得被首次编码污染，两次编码结果必须一致，解码须还原原文。
+test "masked frame reuse/alias regression (all-zero key)" {
+  let payload = b"\x01\x02\x03\x04\x05"
+  let key = b"\x00\x00\x00\x00" // 全 0 密钥
+  let spec = data_spec(Non, 0x01, 1, 1, 1, 1)
+  let raw1 = encode_frame(spec, payload, Some(key))
+  let raw2 = encode_frame(spec, payload, Some(key))
+  assert_eq(raw1, raw2) // 复用输入二次编码结果一致（无脏状态残留）
+  assert_eq(payload, b"\x01\x02\x03\x04\x05") // 输入未被就地改写
+  match parse_udp(raw2) {
+    Ok(f) => {
+      assert_eq(f.msk, true)
+      assert_eq(f.payload, payload) // 解码还原（值与原文一致，无别名共享）
+    }
+    _ => fail("expect Ok(frame)")
+  }
+}
+
+/// 轮A：全 FF 密钥 + 单字节 payload（PLB=1）+ ID 极值往返
+test "masked single-byte frame with all-FF key and max IDs (round A)" {
+  let key = b"\xFF\xFF\xFF\xFF" // 全 FF 密钥：0x00 ^ 0xFF = 0xFF
+  let payload = b"\x00"
+  let raw = encode_frame(data_spec(Non, 0x01, 0xFFFF, 0xFFFF, 0xFF, 0xFE), payload, Some(key))
+  assert_eq(raw.length(), 8 + 1 + 4 + 1) // 8B 头 + 1B Length + 4B Key + 1B Payload
+  match parse_udp(raw) {
+    Ok(f) => {
+      assert_eq(f.msk, true)
+      assert_eq(f.svc_id, 0xFFFF)
+      assert_eq(f.if_id, 0xFFFF)
+      assert_eq(f.inst_id, 0xFF)
+      assert_eq(f.strm_id, 0xFE)
+      assert_eq(f.payload, b"\x00") // XOR 往返还原
+    }
+    _ => fail("expect Ok(frame)")
+  }
+}
+
 /// §4.3 步骤 1：VER 不一致 → RST(0x22)（测试 2.x 版本校验）
 test "version mismatch rejected with 0x22" {
   let raw = df(Non, 0x01, 1, 1, 1, 1)
@@ -254,6 +293,63 @@ test "control frame strm_id semantics (2.17)" {
   }
 }
 
+/// 2.17b 口径定案：控制帧 ACK(0x10) 与 GetIDL 响应(0x11) 的 StrmID=0 不判违规
+/// 控制帧没有"流"概念，0 表示不绑定流（§4.3 步骤 4 例外二）。
+/// 0x11 仅 TCP 单播：TCP 侧合法，UDP 侧按 §7.2 传输绑定拒绝。
+test "ctrl ack/getidl resp strm=0 legal (2.17b)" {
+  // 控制帧 ACK(0x10) + CTR=1 + StrmID=0 → 合法（不参与流绑定校验）
+  match parse_udp(encode_frame(ctrl_spec(Ack, 0x10, 0), b"", None)) {
+    Ok(f) => assert_eq(f.strm_id, 0)
+    Reject(code, _) => fail("2.17b ack strm=0 expect Ok, got Reject(0x0\{code})")
+    Drop => fail("2.17b ack strm=0 expect Ok, got Drop")
+  }
+  // 控制帧 StrmID 范围仍受限：0x80 → 违规（保留值）
+  match parse_udp(encode_frame(ctrl_spec(Ack, 0x10, 0x80), b"", None)) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("2.17b ack strm=0x80 expect Reject(0x00)")
+  }
+  // GetIDL 响应(0x11) StrmID=0：TCP 侧合法
+  let resp_raw = encode_frame(ctrl_spec(Non, 0x11, 0), b"", None)
+  match validate_header(parse_header(resp_raw), 0, true) {
+    None => ()
+    Some(code) => fail("2.17b getidl resp strm=0 on TCP should be legal, got RST(0x\{code})")
+  }
+  // 同一帧在 UDP 上必须拒绝（§7.2 传输约束，与 StrmID 校验无关）
+  match parse_udp(resp_raw) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("2.17b getidl resp on UDP expect Reject(0x00)")
+  }
+}
+
+/// §3.7/§8.1：Subscribe(TTL=0) 取消确认 ACK(Code=0x00, CTR=1) 回显会话 StrmID（0x01~0x7F）
+/// 必须正常解析；同 Code 的连接级帧（心跳 Ping，TYP=NON）StrmID 仍必须 0x00。
+test "cancel ack echoes session strm (3.7/8.1)" {
+  match parse_udp(encode_frame(ctrl_spec(Ack, 0x00, 5), b"", None)) {
+    Ok(f) => assert_eq(f.strm_id, 5)
+    Reject(code, _) => fail("cancel ack expect Ok, got Reject(0x0\{code})")
+    Drop => fail("cancel ack expect Ok, got Drop")
+  }
+  // 心跳 Ping（非 ACK）携带会话 StrmID → 仍属步骤 4 违规
+  match parse_udp(encode_frame(ctrl_spec(Non, 0x00, 5), b"", None)) {
+    Reject(code, _) => assert_eq(code, 0x00)
+    _ => fail("ping strm≠0 expect Reject(0x00)")
+  }
+}
+
+/// §3.2/§4.2：Length 必须按 64 位完整解析。声明长度 0x0000000100000005（2^32+5）
+/// 超过 max_payload_len，必须按帧级超限回 RST(0x23)，不得截断为 32 位后误判为合法。
+test "length 64-bit no truncation on udp" {
+  // 帧头 8B（PLB=7，CTR=0 NON Code=1，SvcID/IfID/InstID/StrmID=1）
+  // + 7B Length（0x0000000100000005 = 2^32+5）+ 5B payload（实际剩余 5B）
+  let raw =
+    b"\x07\x01\x00\x01\x00\x01\x01\x01\x00\x00\x00\x01\x00\x00\x05\x01\x02\x03\x04\x05"
+  match parse_udp(raw) {
+    Reject(code, _) => assert_eq(code, 0x23)
+    Ok(_) => fail("length 2^32+5 must not be accepted after 32-bit truncation")
+    Drop => fail("length 2^32+5 expect Reject(0x23), got Drop")
+  }
+}
+
 /// RST Code 非法（测试 2.20：RST Code ∈ {0x00} ∪ 0x20~0x3F）
 test "rst code validation (2.20)" {
   match parse_udp(encode_frame(spec(false, false, Rst, 0x01, 1, 1, 1, 1), b"", None)) {
@@ -400,6 +496,47 @@ test "tcp coalescing three frames (2.1)" {
   assert_eq(frames[2].strm_id, 3)
 }
 
+/// 轮B：一次 feed 1200 帧粘包（≥1000），全部交付且顺序一致
+test "coalescing 1200 frames in one feed (round B)" {
+  let p = TcpFrameParser::new(0, 5000L)
+  let all : Array[Byte] = []
+  for i in 0..<1200 {
+    let fr = df(Non, 0x01, 1, 1, 1, (i % 0xFE) + 1)
+    for b in fr {
+      all.push(b)
+    }
+  }
+  let frames = feed_frames(p, @codec.bytes_of_array(all), 1000L)
+  assert_eq(frames.length(), 1200) // 无丢帧
+  assert_eq(frames[0].strm_id, 1)
+  assert_eq(frames[1199].strm_id, ((1199 % 0xFE) + 1)) // 顺序不乱
+}
+
+/// 集成用例 2.30：多帧粘包交付完若干帧后进入半帧 → RST(0x26) 必须回显该半帧 StrmID
+test "coalesced frames then half-frame echoes its strm (2.30 integration)" {
+  let p = TcpFrameParser::new(0, 5000L)
+  let f1 = df(Non, 0x01, 1, 1, 1, 1)
+  let f2 = df(Non, 0x01, 1, 1, 1, 2)
+  let f3 = df(Non, 0x01, 1, 1, 1, 3)
+  // 第 4 帧：StrmID=0x2A，payload 1B（总长 8+1+1=10B），粘包时只发帧头 9B
+  let f4 = encode_frame(data_spec(Non, 0x01, 1, 1, 1, 0x2A), b"\xAA", None)
+  let all = @codec.concat_bytes(
+    @codec.concat_bytes(f1, f2),
+    @codec.concat_bytes(f3, @codec.sub_bytes(f4, 0, 9)),
+  )
+  let frames = feed_frames(p, all, 1000L)
+  assert_eq(frames.length(), 3) // 前 3 帧完整交付
+  assert_eq(frames[0].strm_id, 1)
+  assert_eq(frames[2].strm_id, 3)
+  // 超时进入阶段二（帧头完整、Payload 不完整）：仅 RST(0x26)，不关连接
+  let events = p.check_timeout(6100L)
+  assert_eq(events.length(), 1)
+  match events[0] {
+    TcpRst26(strm) => assert_eq(strm, 0x2A) // 回显半帧（第 4 帧）StrmID，而非前 3 帧
+    _ => fail("expect TcpRst26(0x2A)")
+  }
+}
+
 /// TCP 分包：1 帧按 1 字节/次写入（测试 2.2）
 test "tcp byte-by-byte (2.2)" {
   let p = TcpFrameParser::new(0, 5000L)
@@ -453,7 +590,11 @@ test "tcp half-frame stage1 header incomplete (2.5)" {
   let _ = p.feed(@codec.sub_bytes(raw, 0, 4), 1000L) // 仅 4B
   let events = p.check_timeout(6500L) // 超过 tcp_frame_timeout_ms
   assert_eq(events.length(), 2)
-  assert_eq(events[0], TcpRst26)
+  // 阶段一帧头不完整 → 无 StrmID 可回显（0）
+  match events[0] {
+    TcpRst26(strm) => assert_eq(strm, 0)
+    _ => fail("expect TcpRst26")
+  }
   assert_eq(events[1], TcpClose)
 }
 
@@ -464,9 +605,12 @@ test "tcp half-frame stage2 drop mode (2.22)" {
   let raw = encode_frame(data_spec(Non, 0x01, 1, 1, 1, 1), payload, None) // 8+1+100=109B
   let _ = p.feed(@codec.sub_bytes(raw, 0, 18), 1000L) // 帧头 8B + Length 1B + payload 9B
   let events = p.check_timeout(6500L)
-  // 仅 RST(0x26)，不关连接
+  // 仅 RST(0x26)，不关连接；阶段二帧头完整 → 回显当前帧 StrmID（帧 strm_id=1）
   assert_eq(events.length(), 1)
-  assert_eq(events[0], TcpRst26)
+  match events[0] {
+    TcpRst26(strm) => assert_eq(strm, 1)
+    _ => fail("expect TcpRst26(1)")
+  }
   // 发完剩余 91B → 恢复正常接收（测试 2.23：连接继续复用）
   let rest = @codec.sub_bytes(raw, 18, raw.length())
   assert_eq(p.feed(rest, 7000L).length(), 0)
@@ -498,7 +642,10 @@ test "huge declared length stays in drop mode (§3.2)" {
   // 帧头完整 → 阶段二：仅 RST(0x26)，不关连接
   let events = p.check_timeout(6500L)
   assert_eq(events.length(), 1)
-  assert_eq(events[0], TcpRst26)
+  match events[0] {
+    TcpRst26(strm) => assert_eq(strm, 1) // 帧头完整 → 回显当前帧 StrmID=1
+    _ => fail("expect TcpRst26(1)")
+  }
   // R 为 2^40（若被 Int 截断则 R 可能 ≤0，会误退回 Idle 并直接关连接/误解析后续字节）
   // 兜底超时前（2×timeout 内）不得关闭
   assert_eq(p.check_timeout(16000L).length(), 0)
@@ -547,7 +694,11 @@ test "tcp half-frame length incomplete to stage1" {
   let _ = p.feed(@codec.sub_bytes(raw, 0, 8), 1000L) // 仅帧头 8B，Length 未收
   let events = p.check_timeout(6500L)
   assert_eq(events.length(), 2)
-  assert_eq(events[0], TcpRst26)
+  // 帧头（Length）未收齐 → 阶段一，不回显 StrmID
+  match events[0] {
+    TcpRst26(strm) => assert_eq(strm, 0)
+    _ => fail("expect TcpRst26(0)")
+  }
   assert_eq(events[1], TcpClose)
 }
 

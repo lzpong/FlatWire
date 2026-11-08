@@ -91,7 +91,8 @@ fn Sd::send_getidl_query(self : Sd, q : IdlQuery) -> Unit {
     payload,
   )
   if !ok {
-    self.fail_query(q, @errors.Local("tcp send failed"))
+    // §12.6：写入未受理（数据队列满一字节未写 / 连接失效）→ 查询失败并释放 StrmID
+    self.fail_query(q, @errors.Local("tcp send not written (queue full or closed)"))
     return
   }
   // 响应按 (conn, strm) 回显归属匹配（§7.2 并发查询关联）
@@ -191,19 +192,30 @@ fn Sd::handle_getidl_req(
   match reply {
     Ok(def) => {
       // 响应帧形态（§7.2）：CTR=1, TYP=NON, Code=0x11, 回显 StrmID, Payload=JSON 全文
-      let _ = self.transport.send_tcp_frame(
+      // §12.6：GetIDL 响应体量大，按数据帧入队；被拒（队列满）→ 丢弃 + 日志，
+      // 客户端查询超时后按 §7.2 由应用决定重试
+      let ok = self.transport.send_tcp_frame(
         conn_id,
         @frame.ctrl_spec(@frame.Non, 0x11, f.strm_id),
         sd_utf8_to_bytes(def.raw),
       )
+      if !ok {
+        sd_log_error(
+          "[sd] GetIDL 响应未写入（队列满或连接失效）: svc=\{f.svc_id} conn=\{conn_id}",
+        )
+      }
     }
     Err(code) => {
       // RST 回显请求 StrmID（§7.2 错误场景；请求帧 svc/ifid/inst 恒 0 → 全 0 回显）
-      let _ = self.transport.send_tcp_frame(
+      // §12.6：RST 属控制帧直写，写失败仅日志（连接已不可用）
+      let ok = self.transport.send_tcp_frame(
         conn_id,
         @frame.data_spec(@frame.Rst, code, 0, 0, 0, f.strm_id),
         b"",
       )
+      if !ok {
+        sd_log_error("[sd] GetIDL RST 未写入（连接失效）: conn=\{conn_id} code=\{code}")
+      }
     }
   }
 }

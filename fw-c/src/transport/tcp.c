@@ -34,7 +34,10 @@ static void on_sp_rst(void *ud, int code, const fw_head_res_t *echo) {
   // TCP 上收到解析违规 → 回 RST（§4.4；RST 帧本身仍为合法 NON 帧）
   fw_frame_desc_t d;
   fw_make_rst(&d, code, echo->rst_ctr, echo->rst_svc, echo->rst_if, echo->rst_inst, echo->rst_strm);
-  fw_tcp_send_frame(c->stk, c, &d);
+  // RST 属小控制帧：直写不入队（数据队列满时仍可发出）；对端不可写则丢弃，不重试
+  int rc = fw_tcp_send_frame(c->stk, c, &d);
+  if (rc != FW_OK)
+    fw_log(FW_LOG_WARN, "tcp", "RST not sent (rc=%d, peer not reading) %s", rc, c->addrkey);
   fw_log_frame(FW_LOG_WARN, echo->rst_svc, echo->rst_if, echo->rst_inst, echo->rst_strm,
                "Tx", c->addrkey, code, fw_rst_name(code));
 }
@@ -44,6 +47,10 @@ static void on_sp_drop_complete(void *ud) {
 }
 
 // ---- 连接创建/销毁 ----
+
+// 发送背压记账辅助（定义见「发送」段；close 路径在其之前使用，故前置声明）
+static size_t conn_pending(const fw_tcpconn_t *c);
+static void sendq_release(fw_stack_t *st, size_t n);
 
 static fw_tcpconn_t *conn_new(fw_stack_t *st, fw_fd_t fd, const char *ip, uint16_t port, int role) {
   fw_tcpconn_t *c = (fw_tcpconn_t *)calloc(1, sizeof(fw_tcpconn_t));
@@ -88,6 +95,7 @@ static void conn_closed_notify(fw_stack_t *st, fw_tcpconn_t *c) {
 
 void fw_tcp_conn_close(fw_stack_t *st, fw_tcpconn_t *c) {
   if (!c) return;
+  sendq_release(st, conn_pending(c)); // 丢弃未发字节，归还全栈预算
   conn_closed_notify(st, c);
   // 连接等待者按失败推进（连接失败/EOF 场景）
   fw_waiters_fire_fail(st, c);
@@ -132,74 +140,175 @@ int fw_tcp_listen(fw_stack_t *st, char *err, int errsz) {
   return FW_OK;
 }
 
-static void conns_add(fw_stack_t *st, fw_tcpconn_t *c) {
+// 测试注入点：非 NULL 时代替 realloc（返回 NULL 可稳定构造连接表扩容失败）。
+// 生产环境保持 NULL，零开销；仅单测通过 fw_tcp_test_set_realloc_hook 设置。
+static void *(*g_test_realloc_hook)(void *, size_t) = NULL;
+
+void fw_tcp_test_set_realloc_hook(void *(*fn)(void *, size_t)) {
+  g_test_realloc_hook = fn;
+}
+
+// 连接入表；失败返回 -1：调用方必须关闭 fd 并释放连接，否则会留下"已建立但未注册"的连接。
+// 失败原因：①连接数达 cfg.max_conns（R3-8 上限）②连接表扩容 OOM。二者均由调用方统一回收。
+static int conns_add(fw_stack_t *st, fw_tcpconn_t *c) {
+  if (st->cfg.max_conns && st->nconn >= (int)st->cfg.max_conns) return -1; // R3-8：超限拒绝
   if (st->nconn == st->conncap) {
     int nc = st->conncap ? st->conncap * 2 : 8;
-    fw_tcpconn_t **np = (fw_tcpconn_t **)realloc(st->conns, (size_t)nc * sizeof(fw_tcpconn_t *));
-    if (!np) return;
+    void *(*ra)(void *, size_t) = g_test_realloc_hook ? g_test_realloc_hook : realloc;
+    fw_tcpconn_t **np = (fw_tcpconn_t **)ra(st->conns, (size_t)nc * sizeof(fw_tcpconn_t *));
+    if (!np) return -1;
     st->conns = np;
     st->conncap = nc;
   }
   st->conns[st->nconn++] = c;
+  return 0;
 }
 
-// ---- 发送 ----
+// ---- 发送（背压：实现限制，非协议语义）----
+//
+// 记账约定：单连接未发字节 = slen - ssent；全栈 st->sendq_bytes 与各连接之和一致。
+// 仅数据帧与「大控制帧」（>FW_CTRL_DIRECT_MAX，如 GetIDL 响应 0x11）入队并受上限约束；
+// 小控制帧（RST/Ping 等）直写 socket、不进队列——因此数据队列满时 RST/Ping 仍可发出。
+// 队列满不丢帧：在写入任何字节之前返回 FW_ERR_WOULDBLOCK，由调用方退避。
+
+#define FW_CTRL_DIRECT_MAX 1024 // 小控制帧直写阈值（帧总字节数）
+
+static size_t conn_pending(const fw_tcpconn_t *c) { return c->slen - c->ssent; }
+
+// 预算释放（下溢保护：任何记账异常都不会让全局计数变负）
+static void sendq_release(fw_stack_t *st, size_t n) {
+  if (!st || n == 0) return;
+  st->sendq_bytes = (n >= st->sendq_bytes) ? 0 : st->sendq_bytes - n;
+}
+
+// 更新峰值水位（全栈 + 本连接）
+static void sendq_touch_peak(fw_stack_t *st, fw_tcpconn_t *c) {
+  size_t pend = conn_pending(c);
+  if (pend > st->sendq_peak) st->sendq_peak = pend;
+  if (pend > c->q_peak) c->q_peak = (uint32_t)pend;
+}
+
+// 单连接上限 + 全栈预算校验（只做判定，不改记账；pending 已包含在 sendq_bytes 中）
+static int sendq_has_room(fw_stack_t *st, size_t pending, uint32_t len) {
+  if (st->cfg.max_send_queue_bytes && pending + len > st->cfg.max_send_queue_bytes)
+    return 0;
+  if (st->cfg.send_queue_budget_bytes && st->sendq_bytes + len > st->cfg.send_queue_budget_bytes)
+    return 0;
+  return 1;
+}
+
+// §12.6 记账对账（测试/调试用）：全栈增量计数 sendq_bytes 必须等于各连接未发字节之和。
+// 只读不写，不参与生产判定（判定始终是 O(1) 的 st->sendq_bytes 比较）。
+int fw_int_sendq_consistent(const fw_stack_t *st) {
+  if (!st) return 1;
+  size_t sum = 0;
+  for (int i = 0; i < st->nconn; i++) sum += conn_pending(st->conns[i]);
+  return sum == st->sendq_bytes;
+}
+
+// 队列拒绝记账（阈值首次触发时记录起始时刻，供 tick 判定「持续满」）
+static int sendq_reject(fw_stack_t *st, fw_tcpconn_t *c, uint32_t len) {
+  c->q_rejects++;
+  st->sendq_rejects++;
+  if (c->q_full_since_ms == 0) c->q_full_since_ms = fw_now_ms();
+  fw_log(FW_LOG_WARN, "tcp", "send queue full, reject %ubyte frame (pending=%llu/%u, stack=%llu/%u) %s",
+         len, (unsigned long long)conn_pending(c), st->cfg.max_send_queue_bytes,
+         (unsigned long long)st->sendq_bytes, st->cfg.send_queue_budget_bytes, c->addrkey);
+  return FW_ERR_WOULDBLOCK;
+}
+
+// 缓冲容量增长：按 4KB 块对齐（不再按 2 倍扩容——原实现下 scap 最坏可达名义上限的
+// 2 倍，导致「配置 256KB、实际峰值 512KB」）。块内余量 < 4KB，名义上限与实际峰值一致。
+static int sbuf_reserve(fw_tcpconn_t *c, size_t need) {
+  if (need <= c->scap) return FW_OK;
+  size_t nc = ((need + 4095) / 4096) * 4096;
+  uint8_t *nb = (uint8_t *)realloc(c->sbuf, nc);
+  if (!nb) return FW_ERR_MEMORY;
+  c->sbuf = nb;
+  c->scap = nc;
+  return FW_OK;
+}
+
+// 小控制帧直写：不排队、不占预算。部分发送视为失败（控制帧不允许半截入队），
+// 剩余字节丢弃——RST/Ping 的语义可容忍丢失，调用方记录日志即可，不重试。
+static int ctrl_direct_write(fw_tcpconn_t *c, const uint8_t *buf, uint32_t len) {
+  int n = (int)send(c->fd, (const char *)buf, (int)len, 0);
+  if (n == (int)len) return FW_OK;
+  if (n < 0 && !fw_plat_would_block()) return FW_ERR_IO;
+  return FW_ERR_WOULDBLOCK; // EWOULDBLOCK 或部分发送
+}
 
 void fw_tcp_flush(fw_tcpconn_t *c) {
+  if (!c) return;
+  size_t before = conn_pending(c);
   while (c->ssent < c->slen) {
     int n = (int)send(c->fd, (const char *)c->sbuf + c->ssent, (int)(c->slen - c->ssent), 0);
     if (n > 0) {
       c->ssent += (size_t)n;
       continue;
     }
-    return; // EWOULDBLOCK（POLLOUT 继续）或错误（关闭路径处理）
+    break; // EWOULDBLOCK（POLLOUT 继续）或错误（关闭路径处理）
   }
-  c->slen = 0;  // 全部发完：重置缓冲
-  c->ssent = 0;
+  sendq_release(c->stk, before - conn_pending(c)); // 已送入内核的字节归还预算
+  if (conn_pending(c) == 0) {
+    c->slen = 0; // 全部发完：重置缓冲
+    c->ssent = 0;
+    c->q_full_since_ms = 0; // 队列清空：解除「持续满」计时
+    // 大缓冲不常驻：一次性大帧（GetIDL 响应等）发完后释放，避免长连接长期占用峰值内存
+    if (c->scap > 65536) {
+      free(c->sbuf);
+      c->sbuf = NULL;
+      c->scap = 0;
+    }
+  }
 }
 
-void fw_tcp_conn_write(fw_tcpconn_t *c, const uint8_t *buf, uint32_t len) {
-  if (!c || c->closed || !c->connected || len == 0) return;
+int fw_tcp_conn_write(fw_stack_t *st, fw_tcpconn_t *c, const uint8_t *buf, uint32_t len) {
+  if (!c || c->closed || !c->connected || len == 0) return FW_OK;
   c->last_send_ms = fw_now_ms(); // §5.7：发出任意帧刷新空闲计时
-  if (c->slen == 0) {
-    // 无积压：直接尝试发送（避免无谓拷贝）
+  size_t pending = conn_pending(c);
+
+  // 1) 无积压：先尝试直写（成功则不占预算）。只有部分发送的余量才入队。
+  if (pending == 0) {
     int n = (int)send(c->fd, (const char *)buf, (int)len, 0);
-    if (n == (int)len) return;
-    if (n < 0 && !fw_plat_would_block()) return;
+    if (n == (int)len) return FW_OK;
+    if (n < 0 && !fw_plat_would_block()) return FW_ERR_IO;
     if (n < 0) n = 0;
-    // 部分发送：余量入缓冲
+    // 说明：此处不再做上限判定——已经发出 n 字节，余量必须入队才能保证帧完整，
+    // 否则对端会收到半帧。极端情况下单次积压可短暂超过名义上限「最多一帧」，
+    // 这是「不丢帧/不产生半帧」优先于名义上限的代价，由全栈预算与 60s 断连兜底。
     uint32_t rest = len - (uint32_t)n;
-    if (rest > c->scap) {
-      uint8_t *nb = (uint8_t *)realloc(c->sbuf, rest);
-      if (!nb) return;
-      c->sbuf = nb;
-      c->scap = rest;
+    if (sbuf_reserve(c, rest) != FW_OK) {
+      st->sendq_rejects++;
+      return FW_ERR_MEMORY; // 已发部分无法回滚：对端由半帧超时(§4.1)断连
     }
     memcpy(c->sbuf, buf + n, rest);
     c->slen = rest;
     c->ssent = 0;
-    return;
+    st->sendq_bytes += rest;
+    sendq_touch_peak(st, c);
+    return FW_OK;
   }
-  // 有积压：压实后追加
-  if (c->ssent > 0) {
+
+  // 2) 有积压：先判上限/预算，再压实追加（拒写发生在写入任何字节之前，不产生半帧）
+  if (!sendq_has_room(st, pending, len)) return sendq_reject(st, c, len);
+  if (c->ssent > 0) { // 压实已发前缀，回收空间
     memmove(c->sbuf, c->sbuf + c->ssent, c->slen - c->ssent);
     c->slen -= c->ssent;
     c->ssent = 0;
   }
-  if (c->slen + len > c->scap) {
-    size_t nc = c->scap ? c->scap : 1024;
-    while (nc < c->slen + len) nc *= 2;
-    uint8_t *nb = (uint8_t *)realloc(c->sbuf, nc);
-    if (!nb) return;
-    c->sbuf = nb;
-    c->scap = nc;
+  if (sbuf_reserve(c, c->slen + len) != FW_OK) {
+    st->sendq_rejects++;
+    return FW_ERR_MEMORY;
   }
   memcpy(c->sbuf + c->slen, buf, len);
   c->slen += len;
+  st->sendq_bytes += len;
+  sendq_touch_peak(st, c);
+  return FW_OK;
 }
 
 int fw_tcp_send_frame(fw_stack_t *st, fw_tcpconn_t *c, const fw_frame_desc_t *d) {
-  (void)st;
   // GetIDL 响应可达数十 KB：动态编码缓冲（TCP 无 max_payload_len 约束，§2）
   uint32_t need = fw_frame_size(d);
   if (need == 0) return FW_ERR_PARAM;
@@ -213,10 +322,32 @@ int fw_tcp_send_frame(fw_stack_t *st, fw_tcpconn_t *c, const fw_frame_desc_t *d)
   }
   uint32_t n = fw_frame_encode(buf, need, d);
   int rc = FW_OK;
-  if (n) fw_tcp_conn_write(c, buf, n);
-  else rc = FW_ERR_PARAM;
+  if (n) {
+    if (d->ctr && n <= FW_CTRL_DIRECT_MAX) {
+      // 小控制帧（RST/Ping/GetIDL 请求）：直写不入队，数据队列满时仍可发出
+      rc = ctrl_direct_write(c, buf, n);
+      c->last_send_ms = fw_now_ms();
+      if (rc != FW_OK)
+        fw_log(FW_LOG_WARN, "tcp", "ctrl frame not sent (rc=%d, %ubytes) %s", rc, n, c->addrkey);
+    } else {
+      rc = fw_tcp_conn_write(st, c, buf, n);
+    }
+  } else {
+    rc = FW_ERR_PARAM;
+  }
   free(heap);
   return rc;
+}
+
+// 发送队列水位/拒绝统计（实现限制的可观测项，非协议语义）
+void fw_stats_sendq(const fw_stack_t *st, fw_sendq_stats_t *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  if (!st) return;
+  out->queued_bytes = st->sendq_bytes;
+  out->peak_bytes = st->sendq_peak;
+  out->rejects = st->sendq_rejects;
+  out->conn_closed_full = st->sendq_closed_full;
 }
 
 // ---- 客户端按需建连（§5.6 连接复用；并发建连挂等待者） ----
@@ -261,7 +392,13 @@ fw_tcpconn_t *fw_tcp_get_conn(fw_stack_t *st, const char *addr, uint16_t port,
   if (!c) { fw_plat_close(fd); snprintf(err, (size_t)errsz, "out of memory"); return NULL; }
   c->connecting = (r != 0);
   c->connected = (r == 0);
-  conns_add(st, c);
+  // 入表失败（连接表扩容 OOM）：关闭 fd 并释放连接，绝不留未注册连接（fd/内存泄漏）
+  if (conns_add(st, c) != 0) {
+    fw_plat_close(fd);
+    conn_free(c);
+    snprintf(err, (size_t)errsz, "tcp connection limit reached (max_conns=%u) or OOM", st->cfg.max_conns);
+    return NULL;
+  }
   fw_log(FW_LOG_INFO, "tcp", "new conn %s:%u r=%d connecting=%d connected=%d", addr, port, r, c->connecting, c->connected);
   if (w && c->connecting) {
     w->next = c->waiters; // 挂接：连接完成后由 conn_finish_connect 唤醒
@@ -296,7 +433,13 @@ static void tcp_accept(fw_stack_t *st) {
     fw_plat_set_nonblock(fd, 1);
     fw_tcpconn_t *c = conn_new(st, fd, ip, port, FW_ROLE_SERVER);
     if (!c) { fw_plat_close(fd); continue; }
-    conns_add(st, c);
+    // 入表失败：关闭并释放，避免未注册连接泄漏（服务端可无限 accept，风险更高）
+    if (conns_add(st, c) != 0) {
+      fw_plat_close(fd);
+      conn_free(c);
+      fw_log(FW_LOG_WARN, "tcp", "drop accepted from %s:%u (limit %u reached or OOM)", ip, port, st->cfg.max_conns);
+      continue;
+    }
     fw_log(FW_LOG_DEBUG, "tcp", "accepted from %s", c->addrkey);
   }
 }
@@ -385,13 +528,17 @@ void fw_tcp_flush_all(fw_stack_t *st) {
 // 形态发送（全 0 标识——数据帧 SvcID 必须≠0）；StrmID 仅在 0x01~0x7F 时回显
 static void send_frame_timeout_rst(fw_stack_t *st, fw_tcpconn_t *c, int header_complete) {
   uint8_t strm = 0;
+  // 必须按有效区间起点 off 取址：粘包消费后 off 前移，buf[7] 会读到已消费帧的 StrmID
   if (header_complete && c->parser.len >= 8) {
-    uint8_t s = c->parser.buf[7];
+    uint8_t s = c->parser.buf[c->parser.off + 7];
     if (s >= 0x01 && s <= 0x7F) strm = s;
   }
   fw_frame_desc_t d;
   fw_make_rst(&d, FW_RST_FRAME_TIMEOUT, 1, 0, 0, 0, strm);
-  fw_tcp_send_frame(st, c, &d);
+  // 半帧 RST 属小控制帧（直写）：失败时阶段一随后关连接、阶段二保持丢弃模式，无需重试
+  int rc = fw_tcp_send_frame(st, c, &d);
+  if (rc != FW_OK)
+    fw_log(FW_LOG_WARN, "tcp", "half-frame RST not sent (rc=%d) %s", rc, c->addrkey);
   fw_log_frame(FW_LOG_WARN, 0, 0, 0, strm, "Tx", c->addrkey, FW_RST_FRAME_TIMEOUT,
                header_complete ? "Frame Timeout (payload incomplete) -> drop mode"
                                : "Frame Timeout (header incomplete), closing connection");
@@ -403,6 +550,20 @@ void fw_tcp_tick(fw_stack_t *st, int64_t now) {
   for (int i = st->nconn - 1; i >= 0; i--) {
     fw_tcpconn_t *c = st->conns[i];
     if (!c || c->closed || !c->connected || c->connecting) continue;
+
+    // 发送背压（实现限制）：队列持续满超过心跳窗口 → 主动断连。
+    // 「持续满」指从首次拒写（q_full_since_ms）起队列一直未清空；期间对端若恢复读取，
+    // fw_tcp_flush 清空队列会重置该计时，不会被误断。
+    if (conn_pending(c) == 0) {
+      c->q_full_since_ms = 0;
+    } else if (c->q_full_since_ms &&
+               now - c->q_full_since_ms >= (int64_t)(2 * st->cfg.heartbeat_period_ms)) {
+      fw_log(FW_LOG_WARN, "tcp", "send queue full for %lldms (>= 2 x heartbeat %ums), closing %s",
+             (long long)(now - c->q_full_since_ms), 2 * st->cfg.heartbeat_period_ms, c->addrkey);
+      st->sendq_closed_full++;
+      fw_tcp_conn_close(st, c);
+      continue;
+    }
 
     // 半帧两阶段（§4.1）
     if (c->parser.drop_mode) {
@@ -445,7 +606,9 @@ void fw_tcp_tick(fw_stack_t *st, int64_t now) {
       ping.typ = FW_TYP_NON;
       ping.code = 0x00;
       ping.ver = st->cfg.ver;
-      fw_tcp_send_frame(st, c, &ping);
+      // Ping 属小控制帧（直写）：对端暂不可写时跳过本次，2×period 后由失效判定兜底
+      int rc = fw_tcp_send_frame(st, c, &ping);
+      if (rc != FW_OK) fw_log(FW_LOG_DEBUG, "tcp", "ping skipped (rc=%d) %s", rc, c->addrkey);
       c->last_send_ms = now;
     }
   }

@@ -80,7 +80,12 @@ static void send_rst(fw_stack_t *st, int code, const fw_frame_t *echo, const fw_
   fw_frame_desc_t d;
   fw_make_rst(&d, code, echo->ctr, echo->svc_id, echo->if_id, echo->inst_id, echo->strm_id);
   if (meta->transport == 1) {
-    if (meta->conn) fw_tcp_send_frame(st, meta->conn, &d);
+    if (meta->conn) {
+      // RST 属小控制帧，直写不入发送队列；队列满时仍可发出，直写失败仅记录（不重试）
+      int rc = fw_tcp_send_frame(st, meta->conn, &d);
+      if (rc != FW_OK)
+        fw_log(FW_LOG_DEBUG, "rpc", "tcp RST not sent (rc=%d) %s", rc, meta->address);
+    }
   } else {
     fw_udp_send_frame(st, &d, meta->address, meta->port, 1);
   }
@@ -299,8 +304,19 @@ void fw_call_advance(fw_stack_t *st, void *p) {
       d.strm_id = (uint8_t)ctx->strm;
       d.payload = body.p;
       d.payload_len = (uint32_t)body.len;
-      fw_tcp_send_frame(st, c, &d);
+      int src = fw_tcp_send_frame(st, c, &d);
       fw_buf_free(&body);
+      if (src != FW_OK) {
+        // 发送队列满（FW_ERR_WOULDBLOCK / FW_ERR_MEMORY）：请求帧未写入任何字节（不丢帧）。
+        // 必须在此终结调用并回滚：call_finish 释放客户端 StrmID 并摘除活动链，
+        // 否则 StrmID 泄漏、ctx 悬挂至 2000ms 超时（§1.3/§6.2）。
+        ctx->err = src;
+        snprintf(ctx->msg, sizeof(ctx->msg),
+                 "tcp send would block (queue full) svc=%u if=0x%04X", ctx->svc_id, ctx->if_id);
+        fw_log(FW_LOG_WARN, "rpc", "call tx rejected (rc=%d), rollback strm=%d peer=%s", src, ctx->strm, ctx->peer);
+        call_finish(st, ctx);
+        return;
+      }
       if (ctx->is_ff) {
         // TCP FF：发完即释放（传输可靠性由 TCP 保证，§5.2/§6.2）
         call_finish(st, ctx);
@@ -691,7 +707,13 @@ static void handle_client_call(fw_stack_t *st, const fw_frame_t *f, const fw_met
     }
   } else {
     // TCP Response：TYP=NON（§5.1）
-    if (meta->conn) fw_tcp_send_frame(st, meta->conn, &d);
+    if (meta->conn) {
+      int rc = fw_tcp_send_frame(st, meta->conn, &d);
+      if (rc != FW_OK)
+        // 服务端 handler 已返回，未入队的响应无法回传应用层；对端由 2000ms 响应超时终结，
+        // 队列持续满则由 tcp tick 的 2×心跳窗口断连兜底（不重复入队，避免内存增长）
+        fw_log(FW_LOG_WARN, "rpc", "tcp response not queued (rc=%d) svc=%u if=0x%04X", rc, d.svc_id, d.if_id);
+    }
   }
   fw_buf_free(&body);
 }

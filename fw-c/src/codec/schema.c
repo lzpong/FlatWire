@@ -488,6 +488,10 @@ fw_schema_t *fw_schema_build(const fw_value_t *idl, char *err, int errsz) {
       int64_t if_id = jint(ji, "if_id", 0);
       if (if_id <= 0 || if_id > 0xFFFF) FAIL("interface.if_id must be 1..65535");
       d->if_id = (uint16_t)if_id;
+      // §3.5/§11.1：同一服务内 IfID 必须唯一（MUST）——重复定义会使前一条被遮蔽/分派歧义
+      for (int j = 0; j < i; j++) {
+        if (s->ifaces[j].if_id == d->if_id) FAIL("interface.if_id must be unique within service");
+      }
       const char *ty = jstr(ji, "type", "rpc");
       // §11.1：type 仅允许 rpc/ff/event，未知值不得静默按 rpc 处理
       if (strcmp(ty, "rpc") != 0 && strcmp(ty, "ff") != 0 && strcmp(ty, "event") != 0)

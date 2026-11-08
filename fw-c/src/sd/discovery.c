@@ -709,7 +709,11 @@ void fw_disc_on_getidl(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *met
     // Payload ≠3B 或 SvcID=0 → RST(0x20)（§7.2）
     fw_frame_desc_t d;
     fw_make_rst(&d, FW_RST_BAD_REQUEST, 1, 0, 0, 0, f->strm_id);
-    if (meta->conn) fw_tcp_send_frame(st, meta->conn, &d);
+    if (meta->conn) {
+      // RST 为小控制帧：直写不入队，失败仅记录（§7.2 错误通知可容忍丢失）
+      int rc = fw_tcp_send_frame(st, meta->conn, &d);
+      if (rc != FW_OK) fw_log(FW_LOG_DEBUG, "sd", "GetIDL bad-request RST not sent (rc=%d)", rc);
+    }
     return;
   }
   // 服务端匹配 = 本地 IDL 库已加载定义（与实例是否在线无关，§7.2/5.35）
@@ -717,7 +721,10 @@ void fw_disc_on_getidl(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *met
   if (!def) {
     fw_frame_desc_t d;
     fw_make_rst(&d, FW_RST_NOT_FOUND, 1, 0, 0, 0, f->strm_id);
-    if (meta->conn) fw_tcp_send_frame(st, meta->conn, &d);
+    if (meta->conn) {
+      int rc = fw_tcp_send_frame(st, meta->conn, &d);
+      if (rc != FW_OK) fw_log(FW_LOG_DEBUG, "sd", "GetIDL not-found RST not sent (rc=%d)", rc);
+    }
     fw_log_frame(FW_LOG_WARN, e.svc_id, 0, 0, f->strm_id, "Tx", meta->address,
                  FW_RST_NOT_FOUND, "GetIDL: no such (SvcID, MajorVer) loaded");
     return;
@@ -732,7 +739,14 @@ void fw_disc_on_getidl(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *met
   d.strm_id = f->strm_id;
   d.payload = (const uint8_t *)def->json_text;
   d.payload_len = (uint32_t)strlen(def->json_text);
-  if (meta->conn) fw_tcp_send_frame(st, meta->conn, &d);
+  // 响应体可达数十 KB（>1024B），按大控制帧入发送队列并受上限约束；
+  // 入队失败时客户端由 response_timeout_ms 终结（§7.2），不在此重排队
+  if (meta->conn) {
+    int rc = fw_tcp_send_frame(st, meta->conn, &d);
+    if (rc != FW_OK)
+      fw_log(FW_LOG_WARN, "sd", "GetIDL response not queued (rc=%d, %u bytes) peer=%s",
+             rc, d.payload_len, meta->address);
+  }
 }
 // ============================================================
 // 客户端角色：发现缓存查询
@@ -1160,7 +1174,12 @@ static void query_pump(fw_stack_t *st, fw_idl_query_t *q, int64_t now) {
     d.strm_id = (uint8_t)q->strm;
     d.payload = buf;
     d.payload_len = fw_encode_getidl_entry(buf, sizeof(buf), &e);
-    fw_tcp_send_frame(st, c, &d);
+    int src = fw_tcp_send_frame(st, c, &d);
+    if (src != FW_OK)
+      // GetIDL 请求为 3B 空载小控制帧（直写）：对端暂不可写时本轮不重试，
+      // 置 sent=1 交由统一 deadline 超时路径终结查询（§7.2，避免 tick 内自旋）
+      fw_log(FW_LOG_WARN, "sd", "GetIDL Tx would block (rc=%d), deadline handles it: peer=%s strm=%d",
+             src, q->peer, q->strm);
     q->sent = 1;
     // 查询超时复用 response_timeout_ms（§7.2，GetIDL 为请求-响应交互，附录 A）
     q->deadline_ms = now + (int64_t)st->cfg.response_timeout_ms;

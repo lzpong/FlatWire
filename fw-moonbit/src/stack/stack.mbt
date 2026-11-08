@@ -23,6 +23,8 @@ pub(all) struct StackConfig {
   response_timeout_ms : Int64 // 响应超时（2000，§5.1；GetIDL 复用）
   retransmit_interval_ms : Int64 // UDP CON 重传间隔（200，§5.5）
   retransmit_max : Int // 重传次数不含首次（3，§5.5）
+  max_send_queue_bytes : Int // §12.6 背压：单连接数据帧发送队列上限（262144=256KB；0=不限制）
+  send_queue_budget_bytes : Int // §12.6 背压：全栈数据帧发送队列总预算（67108864=64MB；0=不限制）
 }
 
 /// 默认配置（附录 A；idl_dir 必填——IDL 库位置属部署事实，无协议默认值）
@@ -41,6 +43,8 @@ pub fn StackConfig::default(idl_dir : String) -> StackConfig {
     response_timeout_ms: 2000L,
     retransmit_interval_ms: 200L,
     retransmit_max: 3,
+    max_send_queue_bytes: 262144,
+    send_queue_budget_bytes: 67108864,
   }
 }
 
@@ -80,6 +84,8 @@ pub fn Stack::new(cfg : StackConfig) -> Stack {
     max_payload_len: cfg.max_payload_len,
     tcp_frame_timeout_ms: cfg.tcp_frame_timeout_ms,
     heartbeat_period_ms: cfg.heartbeat_period_ms,
+    max_send_queue_bytes: cfg.max_send_queue_bytes,
+    send_queue_budget_bytes: cfg.send_queue_budget_bytes,
   }
   let sdcfg : @sd.SdConfig = {
     period_ms: cfg.period_ms,

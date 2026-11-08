@@ -182,6 +182,72 @@ int suite_stream(void) {
   fw_sp_free(&p);
   TEST_END();
 
+  TEST_BEGIN("§4.1 违规帧帧尾未到齐不得与后续帧拼接（帧走私回归）");
+  reset_cb_state();
+  fw_sp_init(&p);
+  p.on_frame = on_frame;
+  p.on_rst = on_rst;
+  {
+    // VER=1 违规帧（本端 ver=0）：PLB=0 → 帧头 8B；分两段喂入（2B + 6B）
+    fw_frame_desc_t d;
+    memset(&d, 0, sizeof(d));
+    d.ver = 1; d.ctr = 0; d.typ = FW_TYP_NON; d.code = FW_CODE_REQUEST;
+    d.svc_id = 1; d.if_id = 1; d.inst_id = 1; d.strm_id = 1;
+    uint8_t bad[8];
+    uint32_t bn = fw_frame_encode(bad, sizeof(bad), &d);
+    CHECK_EQ_INT(bn, 8);
+    fw_sp_feed(&p, bad, 2); // 首 2B 即判定 VER 不符 → 回 RST
+    CHECK_EQ_INT(g_rst_count, 1);
+    CHECK_EQ_INT(g_nframes, 0);
+    fw_sp_feed(&p, bad + 2, 6); // 补齐帧尾：不得被拼成"合法"帧交付
+    CHECK_EQ_INT(g_nframes, 0);
+    CHECK_EQ_INT(g_rst_count, 1); // 同一违规帧不重复回 RST
+    CHECK_EQ_INT(p.invalid_pending, 0);
+    CHECK_EQ_INT(fw_sp_receiving(&p), 0);
+  }
+  make_frame(buf, sizeof(buf), 2, pl2, 1);
+  fw_sp_feed(&p, buf, 10); // 帧边界已恢复，后续帧正常交付
+  CHECK_EQ_INT(g_nframes, 1);
+  CHECK_EQ_INT(g_frames[0].strm_id, 2);
+  fw_sp_free(&p);
+  TEST_END();
+
+  TEST_BEGIN("§4.1 违规帧 Length 跨包：帧头到齐后进入丢弃并精确收满");
+  reset_cb_state();
+  fw_sp_init(&p);
+  p.on_frame = on_frame;
+  p.on_rst = on_rst;
+  {
+    // VER=1 违规帧，payload=300 → PLB=2，帧头 10B，总长 310B
+    fw_frame_desc_t d;
+    memset(&d, 0, sizeof(d));
+    d.ver = 1; d.ctr = 0; d.typ = FW_TYP_NON; d.code = FW_CODE_REQUEST;
+    d.svc_id = 1; d.if_id = 1; d.inst_id = 1; d.strm_id = 1;
+    uint8_t pl300[300];
+    memset(pl300, 0xEE, sizeof(pl300));
+    d.payload = pl300; d.payload_len = 300;
+    uint8_t bad[310];
+    uint32_t bn = fw_frame_encode(bad, sizeof(bad), &d);
+    CHECK_EQ_INT(bn, 310);
+    fw_sp_feed(&p, bad, 2);   // 判定违规 → RST，等待帧头（Length 未到齐）
+    CHECK_EQ_INT(g_rst_count, 1);
+    CHECK_EQ_INT(p.invalid_pending, 1);
+    fw_sp_feed(&p, bad + 2, 8); // Length 到齐（帧头 10B）→ 未收满 → 丢弃模式
+    CHECK_EQ_INT(p.invalid_pending, 0);
+    CHECK_EQ_INT(p.drop_mode, 1);
+    CHECK_EQ_INT(fw_sp_receiving(&p), 1);
+    fw_sp_feed(&p, bad + 10, 300); // 收满剩余 R → 恢复空闲
+    CHECK_EQ_INT(p.drop_mode, 0);
+    CHECK_EQ_INT(g_nframes, 0); // 违规帧整体被丢弃，未交付
+    CHECK_EQ_INT(g_rst_count, 1);
+  }
+  make_frame(buf, sizeof(buf), 3, pl2, 1);
+  fw_sp_feed(&p, buf, 10);
+  CHECK_EQ_INT(g_nframes, 1);
+  CHECK_EQ_INT(g_frames[0].strm_id, 3);
+  fw_sp_free(&p);
+  TEST_END();
+
   TEST_BEGIN("§3.2 超大声明长度：丢弃剩余 R 按 64 位计算（不截断）");
   reset_cb_state();
   fw_sp_init(&p);
@@ -208,6 +274,39 @@ int suite_stream(void) {
     CHECK_EQ_U64(recv, 15);
     uint64_t remain = fw_sp_enter_drop_mode(&p, 1000);
     CHECK_EQ_U64(remain, (uint64_t)1 << 40); // R = L − 已收，64 位无损
+  }
+  fw_sp_free(&p);
+  TEST_END();
+
+  TEST_BEGIN("§4.1 大帧分片 + 压实：交付 payload 完整（不随缓冲搬迁损坏）");
+  reset_cb_state();
+  fw_sp_init(&p);
+  p.on_frame = on_frame;
+  {
+    // payload=100KB（PLB=3）按 997B 分片喂入；消费过半会触发 sp_compact，
+    // 交付 payload（已拷入 scratch）必须逐字节完整，不能被搬迁覆盖。
+    const uint32_t blen = 100u * 1024u;
+    uint8_t *big = (uint8_t *)malloc(blen);
+    for (uint32_t i = 0; i < blen; i++) big[i] = (uint8_t)(i % 251);
+    fw_frame_desc_t d;
+    memset(&d, 0, sizeof(d));
+    d.ctr = 0; d.ver = 0; d.typ = FW_TYP_NON; d.code = FW_CODE_REQUEST;
+    d.svc_id = 1; d.if_id = 1; d.inst_id = 1; d.strm_id = 9;
+    d.payload = big; d.payload_len = blen;
+    uint8_t *raw = (uint8_t *)malloc(blen + 16);
+    uint32_t rn = fw_frame_encode(raw, blen + 16, &d);
+    CHECK_EQ_INT(rn, blen + 11); // 8B 头 + 3B Length + payload
+    for (uint32_t i = 0; i < rn; i += 997) {
+      uint32_t n = (i + 997 <= rn) ? 997 : rn - i;
+      fw_sp_feed(&p, raw + i, n);
+    }
+    CHECK_EQ_INT(g_nframes, 1);
+    CHECK_EQ_INT((int)g_frames[0].payload_len, (int)blen);
+    CHECK_EQ_INT(g_frames[0].payload[0], 0);
+    CHECK_EQ_INT(g_frames[0].payload[100], 100);
+    CHECK_EQ_INT(g_frames[0].payload[blen - 1], (blen - 1) % 251);
+    free(raw);
+    free(big);
   }
   fw_sp_free(&p);
   TEST_END();

@@ -62,6 +62,11 @@ typedef struct fw_tcpconn {
   int64_t last_send_ms, last_recv_ms;
   // 连接完成等待者（GetIDL/rpc 挂接）
   fw_waiter_t *waiters;
+  // ---- 发送背压（实现限制，非协议语义）----
+  // 未发字节数 = slen - ssent；上限来自 cfg.max_send_queue_bytes / 全栈预算。
+  int64_t  q_full_since_ms;  // 首次因「队列满」拒写的时刻（0=未处于满状态）
+  uint32_t q_rejects;        // 本连接被拒写的帧数
+  uint32_t q_peak;           // 本连接未发字节峰值
 } fw_tcpconn_t;
 
 // ---------- 服务端本地实例（§7.3） ----------
@@ -301,10 +306,20 @@ struct fw_stack {
   uint16_t client_port;
   fw_fd_t tcp_listen;
   fw_tcpconn_t **conns; int nconn, conncap;
+  // ---- 发送背压统计（实现限制，非协议语义；见 fw_config_t 同名注释）----
+  size_t   sendq_bytes;      // 全栈已入队未发字节（与各 conn 的 slen-ssent 之和一致）
+  size_t   sendq_peak;       // 历史峰值
+  uint32_t sendq_rejects;    // 累计拒写次数
+  uint32_t sendq_closed_full;// 因持续满超过 2×heartbeat_period_ms 断连的连接数
+  // 事件轮询集缓存（R3-C：按连接数动态扩容，替代固定 280 上限——max_conns 缺省 1024
+  // 时超出 276 的连接会漏出 poll 等待集，虽然收发路径每轮无条件驱动不会丢数据，
+  // 但唤醒延迟会随连接数恶化）。用 void* 避免在内部头暴露 struct pollfd 依赖。
+  void *pollfds; int *pollidx; int pollcap;
   // 本机地址集（自我回环过滤；平台枚举扩容 8→16）
   char local_addrs[16][48]; int nlocal;
   // 定时
   int64_t last_offer_ms, last_tick_ms;
+  int64_t last_strm_sweep_ms; // R3-9：Strm 池空闲回收上次扫描时刻
   int started;
   int dispatch;            // 分发深度（同步 API 重入保护）
   int stop_requested;
@@ -341,13 +356,19 @@ fw_tcpconn_t *fw_tcp_get_conn(fw_stack_t *st, const char *addr, uint16_t port,
                               fw_waiter_t *w, char *err, int errsz);
 // 按远端 IP 查找服务端入站连接（tcp-event 推送按订阅者源 IP 匹配，§8.2）
 fw_tcpconn_t *fw_tcp_find_server_by_ip(fw_stack_t *st, const char *ip);
-void fw_tcp_conn_write(fw_tcpconn_t *c, const uint8_t *buf, uint32_t len);
+int  fw_tcp_conn_write(fw_stack_t *st, fw_tcpconn_t *c, const uint8_t *buf, uint32_t len);
+// §12.6 记账对账（测试/调试用）：遍历各连接未发字节求和，与全栈增量计数 sendq_bytes 比较。
+// 返回 1=一致，0=漂移（漏减→预算永不触发；多减→误拒合法流量）。O(连接数)，不参与生产判定。
+int fw_int_sendq_consistent(const fw_stack_t *st);
 int fw_tcp_send_frame(fw_stack_t *st, fw_tcpconn_t *c, const fw_frame_desc_t *d);
 void fw_tcp_conn_close(fw_stack_t *st, fw_tcpconn_t *c);
 void fw_tcp_tick(fw_stack_t *st, int64_t now);   // 半帧两阶段 + 心跳（§4.1/§5.7）
 void fw_tcp_flush(fw_tcpconn_t *c);              // 尝试发送缓冲
 void fw_tcp_poll(fw_stack_t *st);                // TCP 连接收发轮询（accept/recv/send）
 void fw_tcp_flush_all(fw_stack_t *st);           // 全连接发送缓冲冲刷（poll 末尾统一驱动）
+// 测试注入点：替换连接表扩容的 realloc（返回 NULL 可稳定构造 conns_add 失败分支）。
+// 生产环境为 NULL（走真实 realloc，零开销）；仅单测使用（见 t_tcp.c R3-6 用例）。
+void fw_tcp_test_set_realloc_hook(void *(*fn)(void *, size_t));
 
 // ---- RST 帧构造（§5.4：回显触发帧标识） ----
 void fw_make_rst(fw_frame_desc_t *d, int code, int ctr, uint16_t svc, uint16_t if_id,

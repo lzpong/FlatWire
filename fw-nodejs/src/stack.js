@@ -30,7 +30,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   retransmit_max: 3,
   tcp_frame_timeout_ms: 5000,
   heartbeat_period_ms: 30000,
+  heartbeat_timeout_ms: null, // §5.7 缺省 = 2×heartbeat_period_ms；显式数值可覆盖（R2-4）
   max_payload_len: 1400,
+  max_tcp_connections: 1024, // R3-8：TCP 入站/出站连接上限（每侧独立计数；超限拒绝）
+  // 发送背压（§12.6 实现限制，非协议语义；0=不限制）：数据帧未发字节上限/总预算。
+  // 控制帧（RST/Ping/GetIDL 请求，帧总长 ≤1024B）直写不入队，不受此上限约束。
+  max_send_queue_bytes: 262144,       // 单连接 256KB
+  send_queue_budget_bytes: 67108864,  // 全栈 64MB
+  strm_pool_idle_ms: 300000, // R3-9：数据/控制 Strm 池空闲回收阈值（默认 5 分钟）
   ver: 0,          // 协议版本（§3.2 VER:2bit）
   idl_dir: './idl', // IDL 库文件夹（纯动态架构 §11.1）
   tcp_enabled: true, // TCP 监听开关（同机双进程测试时客户端角色栈关闭监听，仅保留出站连接能力）
@@ -47,6 +54,7 @@ export class FwStack {
 
     this.log = createLogger({ level: this.cfg.log_level });
     this.strm = new StrmManager();
+    this._poolTimer = null; // R3-9：Strm 池空闲回收定时器（start 创建、stop 清理）
     this.idlStore = new IdlStore(this.cfg.idl_dir, this.log);
     this.udp = new UdpTransport({
       port: this.cfg.port, multicastAddr: this.cfg.multicast_ipv4,
@@ -59,6 +67,9 @@ export class FwStack {
       tcpFrameTimeoutMs: this.cfg.tcp_frame_timeout_ms,
       heartbeatPeriodMs: this.cfg.heartbeat_period_ms,
       heartbeatTimeoutMs: this.cfg.heartbeat_timeout_ms ?? this.cfg.heartbeat_period_ms * 2, // = 2×period（附录 A）
+      maxConns: this.cfg.max_tcp_connections,
+      maxSendQueueBytes: this.cfg.max_send_queue_bytes,       // §12.6 单连接发送队列上限
+      sendQueueBudgetBytes: this.cfg.send_queue_budget_bytes, // §12.6 全栈发送队列预算
       logger: this.log,
     });
 
@@ -88,7 +99,27 @@ export class FwStack {
     if (c.ttl_ms > 255000) throw new InvalidArgument(`ttl_ms must be <= 255000 (Entry TTL is uint8 seconds)`);
     if (c.response_timeout_ms <= 0) throw new InvalidArgument(`response_timeout_ms must be > 0`);
     if (c.tcp_frame_timeout_ms <= 0) throw new InvalidArgument(`tcp_frame_timeout_ms must be > 0`);
+    // heartbeat_timeout_ms 可选覆盖；null/undefined = 采用 §5.7 缺省 2×heartbeat_period_ms
+    if (c.heartbeat_timeout_ms !== null && c.heartbeat_timeout_ms !== undefined) {
+      if (!Number.isFinite(c.heartbeat_timeout_ms) || c.heartbeat_timeout_ms <= 0)
+        throw new InvalidArgument(`heartbeat_timeout_ms must be > 0 or null (default 2*heartbeat_period_ms)`);
+    }
     if (c.max_payload_len <= 0) throw new InvalidArgument(`max_payload_len must be > 0`);
+    // R3-8：连接上限与 R3-9 池回收阈值必须为正整数
+    if (!Number.isInteger(c.max_tcp_connections) || c.max_tcp_connections <= 0)
+      throw new InvalidArgument(`max_tcp_connections must be > 0`);
+    if (!Number.isInteger(c.strm_pool_idle_ms) || c.strm_pool_idle_ms <= 0)
+      throw new InvalidArgument(`strm_pool_idle_ms must be > 0`);
+    // §12.6 发送背压（实现限制）：0=不限制；非 0 时必须为 >=1024 的整数，且全栈预算 >= 单连接上限
+    if (!Number.isInteger(c.max_send_queue_bytes) || c.max_send_queue_bytes < 0)
+      throw new InvalidArgument(`max_send_queue_bytes must be an integer >= 0 (0 = unlimited)`);
+    if (c.max_send_queue_bytes !== 0 && c.max_send_queue_bytes < 1024)
+      throw new InvalidArgument(`max_send_queue_bytes must be 0 (unlimited) or >= 1024`);
+    if (!Number.isInteger(c.send_queue_budget_bytes) || c.send_queue_budget_bytes < 0)
+      throw new InvalidArgument(`send_queue_budget_bytes must be an integer >= 0 (0 = unlimited)`);
+    if (c.send_queue_budget_bytes !== 0 && c.max_send_queue_bytes !== 0
+      && c.send_queue_budget_bytes < c.max_send_queue_bytes)
+      throw new InvalidArgument(`send_queue_budget_bytes must be >= max_send_queue_bytes (or 0 = unlimited)`);
   }
 
   // ============================================================
@@ -124,6 +155,12 @@ export class FwStack {
 
     this.discovery.startOfferLoop(); // 注册即 Offering + 周期广播（§7.3）
     this.discovery.startTick();      // 1s tick：TTL 推进（§7.5）
+    // R3-9：Strm 池空闲回收定时器（每 10s 扫描一次；仅回收无活跃流的空闲池，不影响冷却/序列）
+    this._poolTimer = setInterval(() => {
+      const n = this.strm.collectIdlePools(this.cfg.strm_pool_idle_ms);
+      if (n > 0) this.log.debug('strm', `reclaimed ${n} idle strm pool(s)`);
+    }, 10000);
+    this._poolTimer.unref?.();
 
     // 启动立即发 Find（空 Payload）预热发现缓存（§2 定案：单实例，注册拉取失败可重试）
     this.udp.sendMulticast(encodeFrame({
@@ -148,6 +185,7 @@ export class FwStack {
       if (i < 2) await new Promise((r) => setTimeout(r, 100)); // 间隔 ~100ms（协议固定值 §3.6）
     }
     this.log.info('stack', 'REN x3 sent (graceful shutdown)');
+    if (this._poolTimer) { clearInterval(this._poolTimer); this._poolTimer = null; } // R3-9
     this.discovery.stop();
     this.rpc.stop();
     this.events.stop();

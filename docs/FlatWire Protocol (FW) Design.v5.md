@@ -106,7 +106,7 @@ TCP 无 `max_payload_len` 限制：TCP 为流式传输，一帧可承载完整 I
 
 - **通信前提：双方 VER 必须相等**。VER 不一致则不可通信：
 
-  - 组播帧（Offer / Find / Subscribe）：静默丢弃
+  - 组播帧（Offer / Find）：静默丢弃（Subscribe 虽属 SD 操作，但按 §7.2 走 **UDP 单播**，VER 不一致时按单播帧回 RST(0x22)）
 
   - 单播帧（数据帧 / 控制帧）：回 RST(0x22) 并丢弃
 
@@ -198,7 +198,7 @@ TYP:2 | Code:6
 | 0x03         | SD Subscribe（TTL=0 表示取消订阅）                                                                                              |
 | 0x04         | SD GetIDL（查询服务 IDL，**仅 TCP 单播**；StrmID=客户端协议栈分配 0x01\~0x7F，触发方为协议栈内部，见 §7.2；UDP 收到 → RST(0x00)）                         |
 | 0x05\~0x0F   | 保留                                                                                                                      |
-| 0x10\~0x1F   | SD 成功响应（**0x10 = Subscribe 确认，订阅已建立**，见 §8.1；**0x11 = GetIDL 响应**，回显请求 StrmID，Payload=IDL JSON 全文，见 §7.2；0x12\~0x1F 保留） |
+| 0x10\~0x1F   | SD 成功响应（**0x10 = Subscribe 确认，订阅已建立**，见 §8.1；**0x11 = GetIDL 响应**，回显请求 StrmID（StrmID=0 表示不绑定流，见 §4.3 步骤 4），Payload=IDL JSON 全文，**仅 TCP 单播且一次发完**，见 §7.2；0x12\~0x1F 保留） |
 | 0x20\~0x2F   | SD 客户端错误                                                                                                                |
 | 0x30\~0x3F   | SD 服务端错误                                                                                                                |
 
@@ -352,21 +352,23 @@ StrmID 不在该对端活跃表中时，ACK/RST 直接丢弃。
    校验 TYP=ACK 时 Code∈{0x00, 0x10(仅 CTR=1)} 且 PLB=0
    校验 TYP=RST 时 PLB=0 且 Code∈{0x00} ∪ 0x20~0x3F
    校验 TCP 传输上 TYP∉{CON, ACK}（TCP 不使用 CON/ACK，见 §3.7）
-   校验 UDP 传输上 CTR=1 且 Code=0x04（GetIDL 仅 TCP 单播，见 §7.2）
+   校验 UDP 传输上 CTR=1 且 Code∈{0x04,0x11}（GetIDL 查询/响应仅 TCP 单播，见 §7.2）
    校验失败 → 回 RST(0x00) 并丢弃
 3. 读 SvcID/IfID（**TYP=RST 跳过本节**，见下方豁免说明）
    校验控制帧 SvcID=0x0000 且 IfID=0x0000
    校验数据帧 SvcID≠0x0000 且 IfID≠0x0000（ID=0 通配仅 SD Entry 场景，见 §3.5）
 4. 读 InstID/StrmID（**TYP=RST 跳过本节**，见下方豁免说明）
    校验控制帧 InstID=0、REN=1 时 StrmID=0、数据帧 InstID≠0x00
-   校验控制帧 StrmID：0x00（连接级）或 0x01~0x7F（Subscribe 会话 / GetIDL 查询，见 §7.2）
+   校验控制帧 StrmID：0x00（不绑定流/连接级）或 0x01~0x7F（Subscribe 会话 / GetIDL 查询，见 §7.2）
    校验控制帧 StrmID 语义：Code∈{0x03,0x04} 时 StrmID∈0x01~0x7F；Code∈{0x00,0x01,0x02} 时 StrmID=0x00
+     （例外一：Subscribe(TTL=0) 的取消确认 ACK(Code=0x00) 回显会话 StrmID∈0x01~0x7F，见 §3.7/§8.1）
+     （例外二：控制帧 ACK(Code=0x10) 与 GetIDL 响应(Code=0x11) **不参与流绑定校验**，StrmID=0 合法）
      违反 → 回 RST(0x00) 并丢弃（组播帧静默丢弃）
    校验数据帧 StrmID∈0x01~0xFE（0x00=连接级、数据帧禁用；0xFF 保留；越界 → RST(0x00)）
 
 > **TYP=RST 的 ID 校验豁免**：任何 TYP=RST 的帧（**不区分控制帧 CTR=1 / 数据帧 CTR=0**）**都不参与步骤 3/4** 的 SvcID/IfID/InstID/StrmID 校验，只执行步骤 1/2 的形态与 Code 值域校验（VER、CTR/REN 一致性、PLB=0、Code∈{0x00}∪0x20~0x3F、控制帧 MSK=0、传输绑定）。原因：RST 需回显触发帧的 ID（§5.4），而回显值可能超出控制帧或数据帧的合法范围（例如数据帧触发的 StrmID 可达 0xFE、SvcID/IfID 可能为 0x0000）；若对 RST 施加步骤 3/4 校验，收发双方会"RST 判违规 → 回 RST → 对端再判违规"，形成 RST 回环风暴。
 >
-> **ACK 不适用本豁免**：数据帧 ACK（CTR=0）虽同样回显触发帧 ID，但其回显值必须落在合法范围（SvcID≠0x0000、IfID≠0x0000、InstID≠0x00、StrmID∈0x01~0xFE），**仍执行步骤 3/4**，违规按步骤 4 回 RST(0x00)。
+> **ACK 不适用本豁免**：数据帧 ACK（CTR=0）虽同样回显触发帧 ID，但其回显值必须落在合法范围（SvcID≠0x0000、IfID≠0x0000、InstID≠0x00、StrmID∈0x01~0xFE），**仍执行步骤 3/4**，违规按步骤 4 回 RST(0x00)。控制帧 ACK(Code=0x00) 为 Subscribe(TTL=0) 取消确认，按 §3.7/§8.1 回显会话 StrmID（0x01~0x7F），是步骤 4 的明文例外（见步骤 4 括号说明），不视为违规。
 
 5. 若 PLB>0 读 Payload Length(plb 字节)；PLB=0 时 Length=0
    UDP：超 max_payload_len → 回 RST(0x23)（TCP 无此校验，见 §2）
@@ -387,7 +389,9 @@ StrmID 不在该对端活跃表中时，ACK/RST 直接丢弃。
 | IDL 级字节契约校验失败（字段越界/截断、`fixed_len` 不符、`max_len` 超限、`bool` 非法、`enum` 超出 `base` 值域、CRC 失败等，解码阶段） | 回 RST(0x20)，丢弃帧（TCP/UDP 一致，见 §12.1）                             |
 | TCP 半帧超时——帧头不完整（<8B）                                              | 回 RST(0x26)，丢弃残缺帧，**关闭连接**（帧总长不可知，无法重同步；客户端按 §5.6 自动重连）         |
 | TCP 半帧超时——帧头完整、Payload 不完整                                        | 回 RST(0x26)，进入丢弃模式按帧头声明的帧总长精确丢弃剩余字节，收满后恢复正常接收，**连接不关闭**（见 §4.1） |
-| UDP 上收到 GetIDL（CTR=1, Code=0x04）                                  | 回 RST(0x00)，丢弃帧（GetIDL 仅 TCP 单播，传输绑定违规，见 §7.2；组播帧静默丢弃）          |
+| UDP 上收到 GetIDL 查询（CTR=1, Code=0x04）                                  | 回 RST(0x00)，丢弃帧（GetIDL 仅 TCP 单播，传输绑定违规，见 §7.2；组播帧静默丢弃）          |
+| UDP 上收到 GetIDL 响应（CTR=1, Code=0x11）                                  | 回 RST(0x00)，丢弃帧（同上，响应同样仅 TCP 单播；组播帧静默丢弃）                        |
+| 控制帧 StrmID 语义违规（Code∈{0x03,0x04} 但 StrmID=0，或 Code∈{0x00,0x01,0x02} 但 StrmID≠0） | 回 RST(0x00)，丢弃帧（组播帧静默丢弃）；**例外一/二见 §4.3 步骤 4**：取消确认 ACK(0x00) 回显会话 StrmID、ACK(0x10) 与 GetIDL 响应(0x11) 不参与流绑定校验（StrmID=0 合法） |
 
 ***
 
@@ -646,7 +650,7 @@ FF 无应用层响应，无应用层超时；送达保证由传输层 CON/ACK �
 | Offer     | 0x01 | N × Offer Entry                       | UDP 组播，周期 `period`                                                                   | TTL=0 表示停止提供；不携带 Endpoint（IP 由 socket 源地址获取）                                                                                                                                                   |
 | Find      | 0x02 | 空 或 N × Find Entry                    | UDP 组播                                                                               | 空 Payload = 查询所有服务；带 Entry 时必须指定 SvcID（非零），InstID 可 0x00 通配SvcID 非通配时 MajorVer 参与精确匹配，MinorVer 不参与匹配响应帧格式与 Offer 相同（Code=0x01），由服务端 UDP 单播发送；**响应超限时适用下方同一拆帧策略**                               |
 | Subscribe | 0x03 | N × Subscribe Entry                   | UDP 单播，首次 CON / 取消（TTL=0）CON / 保活 NON，周期 `period`；**帧携带会话 StrmID（0x01\~0x7F，客户端分配）** | Entry 携带 TTL(秒)，TTL=0 表示取消订阅（延迟到下次 tick 移除）；同一订阅会话（首次/保活/取消）全程复用同一 StrmID；首次 CON 的服务端回应见 §8.1；**同会话 StrmID 的重复 CON 到达 = 重传判定**（服务端重发上次确认，见 §5.5/§8.1）；NON 保活到达 = TTL 刷新；TTL 倒计时归零视为离线          |
-| GetIDL    | 0x04 | 1 × GetIDL Entry（3B：SvcID + MajorVer） | **仅 TCP 单播**；帧携带查询 StrmID（0x01\~0x7F，客户端分配）                                          | 查询服务 IDL 全文；服务端回 Code=0x11（**回显请求 StrmID**，Payload=完整 IDL JSON 文本）；本地库无该 (SvcID, MajorVer) 已加载定义 / MajorVer 不匹配 → RST(0x24)；Payload ≠3B → RST(0x20)；UDP 上收到 → RST(0x00)（传输绑定违规）；详见下方 GetIDL 语义 |
+| GetIDL    | 0x04 | 1 × GetIDL Entry（3B：SvcID + MajorVer） | **仅 TCP 单播**（一次发完，不分包/不分段，见下方「响应帧形态」）；帧携带查询 StrmID（0x01\~0x7F，客户端分配）                                          | 查询服务 IDL 全文；服务端回 Code=0x11（**回显请求 StrmID**，Payload=完整 IDL JSON 文本）；本地库无该 (SvcID, MajorVer) 已加载定义 / MajorVer 不匹配 → RST(0x24)；Payload ≠3B → RST(0x20)；UDP 上收到 → RST(0x00)（传输绑定违规）；详见下方 GetIDL 语义 |
 
 **Subscribe 会话 StrmID 规则**：
 
@@ -671,7 +675,8 @@ FF 无应用层响应，无应用层超时；送达保证由传输层 CON/ACK �
 
 - **服务端处理**：按 `(SvcID, MajorVer)` 在本地 IDL 库定位**任一**匹配的**已加载 IDL 定义（与实例是否在线无关）**——IDL 为服务级事实，InstID 不参与（见 §7.1）；实例注销不卸载定义（定义生命周期 = IDL 库文件，独立于实例 handler）。定位后读取其 IDL JSON 全文回响应——纯协议栈行为，应用无感知
 
-- **响应帧形态**：`CTR=1, TYP=NON, Code=0x11, StrmID=回显请求值`，Payload = 完整 IDL JSON 文本（UTF-8，无长度前缀——Payload Length 即长度，无 Entry 前缀——IDL 自含 svc\_id/版本，协议栈落盘前须校验与请求一致，不一致按查询失败处理）
+- **响应帧形态**：`CTR=1, TYP=NON, Code=0x11, StrmID=回显请求值`，Payload = 完整 IDL JSON 文本（UTF-8，无长度前缀——Payload Length 即长度，无 Entry 前缀——IDL 自含 svc\_id/版本，协议栈落盘前须校验与请求一致，不一致按查询失败处理）。**传输约束：GetIDL 响应在 TCP 上一次发完**——整帧（帧头 + Payload）作为一个完整帧写入连接，不得拆分为多个"分包/多段"逻辑单元，也不得以 UDP 报文形式出现；这是该帧型的专项约束（IDL 文本可达数十 KB，UDP `max_payload_len` 不可行），不是对所有帧的通用规则。TCP 字节流层若有分包，仅属内核传输细节，协议语义上仍视为一次完整的单帧发送（接收端按 §4.1 帧边界重组，不按段交付）
+- **响应 StrmID=0 的处理（与请求的差异）**：响应按特例**不参与流绑定校验**（§4.3 步骤 4 例外二）——异常实现若回显 StrmID=0，接收端不判违规、不据此回 RST；请求-响应关联按请求时记录的 StrmID 匹配，未匹配到查询的响应静默丢弃（超时兜底由查询侧 `response_timeout_ms` 承担）。正常实现应回显请求 StrmID（0x01\~0x7F）
 
 - **落盘与加载（协议要求）**：拉取成功后，协议栈**将 IDL 持久化写入本地 IDL 库**（文件形式，见 §11.1）→ 解析加载 → 继续当前请求的编解码。持久化保证协议栈重启后本地命中，无需重复拉取；**落盘失败**（磁盘满/只读等）时**降级为仅内存加载使用**并记 Error 日志（可用性优先，重启后需重新拉取）
 
@@ -946,6 +951,8 @@ Offer 与 Subscribe 两侧规则完全一致：客户端维护远端实例的 Of
 
 **强制约束**：`string` / `bytes` / `array` 必须声明 `fixed_len` 或 `max_len` 之一；二者都缺 → **IDL 加载失败**（见 §11.1）——无上界则长度前缀宽度无法静态确定，解码端无法定位后续字段。
 
+> **校验边界**：此处的"必须声明"是协议要求（缺失则无法定位字段，属语法必需）；而声明值本身（`max_len` 取多大、字段有多少、嵌套多深）是否合理**不属于协议合规判定**——协议只保证按声明解析，声明合理性由 IDL 工具与应用层负责，见 §11.1「IDL 上界的责任边界（非协议合规项）」。
+
 | 声明 | 长度前缀 | 内容 |
 | ---------------- | ---------------- | ------------------------------------ |
 | `fixed_len = N` | **无** | string/bytes：恰 N 字节；array：恰 N 个元素裸排 |
@@ -1155,6 +1162,13 @@ IDL 采用 JSON 格式。**所有 IDL 数值字面量一律十进制**（JSON �
 
 `inst_id` 由运行时注册服务时提供，不在 IDL 中声明。`(SvcID, InstID)` 的跨节点唯一性属部署规划问题，不在协议与 IDL 职责范围内（见 §3.5）。
 
+**IDL 上界的责任边界（非协议合规项）**：
+
+- 协议栈**只负责按 IDL 声明解析**：`fixed_len` / `max_len` / `max_payload` 一旦声明，编解码按该声明校验；声明本身是否合理（字段数量是否过多、嵌套层数是否过深、`max_len` / `max_payload` 是否超出实际需求或设备承载能力）**不属于协议合规判定**，由 IDL 工具链（加载期静态检查）与应用层（服务接口数据设计）负责。
+- 三栈的**帧解析层 / IDL 加载层不得在默认配置下**因"声明合理性"新增拒绝条件（不得以字段数、嵌套深度、`max_len` 数值为由拒绝加载 IDL 或拒绝帧）；否则会破坏互操作——同一份 IDL 在不同实现上的可用性将不一致。确需本实现防护的，只能按下条以"可配置实现限制"提供，且默认不生效、默认值不影响任何按本规范合法的 IDL 与帧。
+- 如某实现出于防护目的自行设置防御性上限（如最大字段数、最大嵌套深度、单字段 `max_len` 上限），必须同时满足：① 可配置；② 在实现文档中标注为"**实现限制（implementation limit）**"，明确非协议要求；③ 默认值不得影响按本规范合法的 IDL 与帧；④ 超限只在本实现内报错（如本地加载失败返回实现层错误），**不得**作为跨实现的协议合规判定或互操作前置条件。
+- 协议层唯一的数值上限是 §2 / §3.8 的 `max_payload_len`（UDP）与 PLB=7 的 2^56−1 帧格式上限；二者是帧格式/传输约束，不属于本条所指的"声明合理性评估"。
+
 `transport` 绑定声明内嵌于 IDL JSON（`interfaces[].transport` 字段），协议栈运行时解析用于路由（rpc/ff 与 event 的传输选择，见 §3.8/§7.2）——无代码生成、无 Stub：编解码由协议栈按已加载的 IDL 动态执行。
 
 **纯动态架构：IDL 运行时加载（协议要求）**：
@@ -1211,7 +1225,7 @@ IDL 采用 JSON 格式。**所有 IDL 数值字面量一律十进制**（JSON �
 
 | 错误码        | 名称                  | 触发条件                                                                                                                                                                                                                             | 恢复策略                                                   |
 | ---------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| 0x00       | Protocol Violation  | 帧头一致性校验失败（CTR/REN 组合非法、REN=1 时 TYP≠NON 或 Code≠0x00、ACK 时 Code∉{0x00, 0x10（仅 CTR=1，见 §8.1）}、ACK/RST 时 PLB>0、SvcID/IfID/InstID 超出字段值域或数据帧 ID=0 误用、**控制帧 MSK=1**、**控制帧 StrmID 与 Code 语义不符**\[Subscribe/GetIDL 带 0x00、连接级帧带 0x01\~0x7F，见 §4.3 步骤 4]；IfID 的 rpc/ff 与 event 分区仅为 SHOULD 建议，**不参与违规判定**；**任何 TYP=RST（不区分控制帧 CTR=1 / 数据帧 CTR=0）不参与步骤 3/4 的 ID 校验**，见 §4.3 豁免说明） | 丢弃帧，不响应（组播）；单播回 RST(0x00)                              |
+| 0x00       | Protocol Violation  | 帧头一致性校验失败（CTR/REN 组合非法、REN=1 时 TYP≠NON 或 Code≠0x00、ACK 时 Code∉{0x00, 0x10（仅 CTR=1，见 §8.1）}、ACK/RST 时 PLB>0、SvcID/IfID/InstID 超出字段值域或数据帧 ID=0 误用、**控制帧 MSK=1**、**控制帧 StrmID 与 Code 语义不符**\[Subscribe/GetIDL 带 0x00、连接级帧带 0x01\~0x7F（例外一：取消确认 ACK(Code=0x00) 回显会话 StrmID∈0x01\~0x7F，见 §4.3 步骤 4/§8.1）；**例外二：控制帧 ACK(Code=0x10) 与 GetIDL 响应(Code=0x11) 不参与流绑定校验，StrmID=0 合法**，见 §4.3 步骤 4/§7.2]，见 §4.3 步骤 4]；**UDP 上收到 GetIDL 查询(0x04) 或响应(0x11)**（传输绑定违规，见 §7.2）；IfID 的 rpc/ff 与 event 分区仅为 SHOULD 建议，**不参与违规判定**；**任何 TYP=RST（不区分控制帧 CTR=1 / 数据帧 CTR=0）不参与步骤 3/4 的 ID 校验**，见 §4.3 豁免说明） | 丢弃帧，不响应（组播）；单播回 RST(0x00)                              |
 | 0x20       | Bad Request         | Payload 字节序列与 IDL 契约不符（字段越界/截断、`bool` 非 `0x00`/`0x01`、`fixed_len` 长度不符、`max_len` 超限、`enum` 值超出 `base` 值域）、CRC 校验失败、控制帧格式错误（TCP/UDP 一致）                                                                                                                      | 应用层修正请求格式                                              |
 | 0x21       | —                   | 保留                                                                                                                                                                                                                               | —                                                      |
 | 0x22       | Unsupported Version | VER 与本端不一致                                                                                                                                                                                                                       | 双方需使用相同 VER                                            |
@@ -1257,6 +1271,37 @@ IDL 采用 JSON 格式。**所有 IDL 数值字面量一律十进制**（JSON �
 ```
 
 其中 `Msg` 取 §12.1 / §12.2 中的错误码名称（如 `Not Found`、`Payload Too Large`）。
+
+### 12.5 明确不做项（审查结论）
+
+| 项 | 结论 | 理由 |
+|----|------|------|
+| `encodeFrame` 缓冲池化（Node/C/MoonBit） | **不做** | 实测吞吐已达标（见基准记录：Node 1MB/1400B 分片 2.75ms、C 粘包 <1ms、MoonBit 20\~30MB/s 且无 O(n²)）；池化会引入缓冲生命周期/并发安全/别名校验等风险，收益不抵风险 |
+| MoonBit 逐字节 TCP 状态机改为批量解析 | **不做（仅记常数差异）** | 逐字节实现复杂度低、无 O(n²)：基准 A（1MB 按 1400B 分片）40.8ms 对比 C（一次喂入）33.6ms，仅约 1.2× 常数差异，且 MoonBit 实现吞吐 20\~30MB/s 满足协议场景；重写状态机风险高于收益 |
+
+### 12.6 实现限制：发送背压（非协议语义）
+
+> 本节记录**实现层**能力边界，**不属于协议合规判定**，不改帧格式、不新增 RST 码、不影响互操作；各实现可独立选择是否提供及默认值。
+
+| 项 | 规则 |
+|----|------|
+| 数据帧发送队列 | 每个 TCP 连接「已入队未发出」的数据帧字节数设有上限（参考实现默认 256KB，可配置；0=不限制） |
+| 全栈预算 | 所有连接的数据帧未发字节合计设有总预算（参考实现默认 64MB，可配置），防止多连接合计耗尽内存 |
+| 控制帧优先级 | 小控制帧（RST/Ping/GetIDL 请求等，帧总长 ≤1024B）**直写 socket、不进数据队列**；因此数据队列满时 RST/Ping 仍可发出。GetIDL 响应（0x11）体积可达数十 KB，按数据帧入队并受上限约束 |
+| 满时行为 | **不丢帧、不写半帧**：在写入任何字节之前向上层返回「暂不可写」（参考实现 `FW_ERR_WOULDBLOCK`，实现层错误码，非协议错误），调用方自行退避重试 |
+| 持续满断连 | 队列自首次拒写起持续未清空且超过心跳窗口（2×`heartbeat_period_ms`）→ 主动断连；期间若队列清空则计时归零 |
+| 观测量 | 暴露当前水位、峰值、累计拒写次数、持续满断连次数（参考实现 `fw_stats_sendq`） |
+| 容量增长 | 队列缓冲按固定块（4KB）增长，不按 2 倍扩容，保证「配置上限 ≈ 实际内存峰值」 |
+| `notify` 返回值 | 返回成功仅表示「已受理并尝试推送」，**不保证每个 TCP 订阅者的帧都已入队**；单个订阅者因队列满被拒时仅记录日志并计入拒写统计，不影响 `notify` 返回值（订阅者按 §8.2 的 TTL/保活语义自行恢复） |
+| 控制帧直写失败 | RST/Ping 直写失败时不重试、不排队：Ping 跳过本次（2×period 后按失效处理），RST 记录日志后放弃（若该场景随后关闭连接，则随关闭一并生效） |
+
+> **实现状态**：C（`fw-c`）、Node（`fw-nodejs`）与 MoonBit（`fw-moonbit`）均已实现本节（MoonBit 为第三批，`examples/bp_probe` 提供真实 socket 拥塞实测）。
+> Node 的「暂不可写」以 `TcpConn.write` 返回 `false` 表达，语义为**本帧未写入任何字节**（语义收紧：旧实现直接返回 `socket.write()` 的 boolean，`false` 仅代表缓冲超过 highWaterMark、帧仍被写入）。
+> MoonBit 的「暂不可写」以 `Transport::send_tcp_frame` 返回 `false` 表达：**签名不变，语义自本版起由「编码成功」扩展为「写入/入队成功」**——`true` = 控制帧已直写或数据帧已进入有界队列；`false` = 编码失败、数据队列满（一字节未写）或连接不存在/已失效。底层 `ffi_tcp_write` 同步由返回 `Unit` 改为返回 `Bool` 并透传结果。调用方均按返回值处理：rpc 客户端 `call` 写失败回滚 `pending` 与 StrmID，`fire_forget` 无论成败均释放 StrmID；GetIDL 查询失败走 `fail_query`（释放 StrmID + 回调等待者），GetIDL/事件/服务端响应写失败记录日志后丢弃（TCP NON 无重传，由对端响应超时兜底）。
+> 三栈观测量本轮均仅内部计数 + 日志，未提供公开 API（Node：`TcpConn.qBytes/qPeak/qRejects`、`TcpTransport.sendqPeak/sendqRejects/sendqClosedFull`；MoonBit：`__fw.q.rejects/peak/closedFull`）。
+> **全栈预算判定（本版三栈统一为 O(1) 增量计数）**：不再在每次写入时遍历所有连接求和，而是维护全栈累计字节数——数据帧入队加、`drain` 归还、连接关闭/销毁扣减该连接残留量；判定为 `used + 帧长 > budget` 的单次比较。C：`st->sendq_bytes`（数据帧独立队列计数，`sendq_release` 归还）；Node：`TcpTransport.sendqBytes` + 每连接 `qData`；MoonBit：`__fw.q.used` + 每连接 `qstate.dataB`。上限值、拒写返回、控制帧直写语义均不变。
+> **记账漂移防护（对账断言）**：增量计数与遍历求和一旦偏差，漏减会让预算永不触发（等于没有背压），多减会误拒合法流量。三栈对账手段：C `fw_int_sendq_consistent`（遍历各连接未发字节之和 == `sendq_bytes`，测试每步调用）；Node `checkSendqAccounting: true` 开启后每次入队/drain/关闭扣减后执行 `_assertSendqAccounting`；MoonBit `__fw.q.check` 开启后每次记账变更执行 `qcheck`。漂移立即抛错。Node/MoonBit 的对账把控制帧直写字节单列控制桶（`qCtrl`/`ctrlB`，判定只用数据桶），并扣除「部分 flush 但尚未同步」的滞后量（`lag`）——`writableLength` 的部分下降没有事件通知，属已知观测滞后，不影响判定；关闭漏扣不会留下 accounted 残差，仍会被抓到。
+> **水位口径差异与统一判断（本版仅评估，未统一）**：C 以独立数据帧队列计数为水位（控制帧字节不计入）；Node/MoonBit 以 `socket.writableLength` 为水位（含控制帧直写字节），因此记账拆为数据桶/控制桶，**预算判定实际只用数据帧字节**，控制帧不占配额。判断：不必统一。代价与收益：把 Node/MoonBit 改为独立数据帧队列，需要自行维护待发帧与逐帧回收（写入路径、flush 记账、关闭回收全面改动，并失去 `writableLength` 的内核缓冲反馈），收益仅是消除每连接 ≤1024B 的控制帧水位占位——而本版分桶后其对判定的影响已为 0；反向把 C 改为 `writableLength` 口径则依赖平台 socket 内部缓冲，破坏可移植性与确定性。故保留现状：差异只在观测量口径，不在判定口径。
 
 ***
 

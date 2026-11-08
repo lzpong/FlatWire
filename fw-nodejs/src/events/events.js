@@ -108,11 +108,17 @@ export class EventsModule extends EventEmitter {
         this.log.warn('events', `tcp-event push paused (no connection from ${sub.peerIp})`);
         return;
       }
-      conn.write({
+      const ok = conn.write({
         ctr: 0, typ: TYP.NON, code: CODE.NOTIFICATION,
         svc_id: svcId, if_id: iface.if_id, inst_id: instId, strm_id: strm, payload: buf,
       });
       this.strm.releaseServerStream(peer, svcId, instId, strm); // TCP 自带可靠性，发完即释放
+      if (!ok) {
+        // 发送背压（§12.6）：write=false = 帧未写入任何字节（发送队列满/连接失效）。
+        // 事件为状态型推送（非确认信号，§8.1），不重排队不补发：丢弃本帧，下次 notify/重连恢复；
+        // 该失败计入 TcpConn.qRejects 与 TcpTransport.sendqRejects 统计。
+        this.log.warn('events', `tcp-event push dropped (send queue full/conn closed): peer=${peer} if=0x${iface.if_id.toString(16)}`);
+      }
       return;
     }
 

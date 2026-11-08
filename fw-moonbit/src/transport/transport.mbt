@@ -24,6 +24,8 @@ pub(all) struct TransportConfig {
   max_payload_len : Int // §2 max_payload_len（UDP 帧级超限 → 0x23，默认 1400）
   tcp_frame_timeout_ms : Int64 // §2 tcp_frame_timeout_ms（TCP 半帧超时，默认 5000）
   heartbeat_period_ms : Int64 // §2 heartbeat_period_ms（心跳周期，默认 30000；失效阈值=2×）
+  max_send_queue_bytes : Int // §12.6 背压：单连接数据帧发送队列上限（262144=256KB；0=不限制）
+  send_queue_budget_bytes : Int // §12.6 背压：全栈数据帧发送队列总预算（67108864=64MB；0=不限制）
 } derive(Eq)
 
 // v0.10 惯用法：derive 生成的方法须显式 extend 提升为常规方法（moonc 警告 0079）
@@ -107,6 +109,16 @@ fn make_rst_frame(code : Int, hdr : @frame.FrameHeader?) -> Bytes {
   }
 }
 
+/// §4.1 半帧超时 RST(0x26)：按控制帧形态发送（CTR=1、SvcID/IfID/InstID 全 0），
+/// StrmID 仅在 0x01~0x7F 时回显当前帧的 StrmID——与 Node/C 行为一致
+/// （Node tcp.js `_onFrameTimeout` / C tcp.c `send_frame_timeout_rst`）。
+fn make_rst26_frame(strm : Int) -> Bytes {
+  let echo = if strm >= 0x01 && strm <= 0x7F { strm } else { 0 }
+  try @frame.encode_frame(@frame.ctrl_spec(@frame.Rst, @errors.RST_FRAME_TIMEOUT, echo), b"", None) catch {
+    _ => b"" // 不可达：RST_FRAME_TIMEOUT=0x26 在合法错误码区间
+  }
+}
+
 /// 创建传输层实例（不启动；start 挂接 FFI）
 pub fn Transport::new(
   cfg : TransportConfig,
@@ -145,6 +157,8 @@ pub fn Transport::start(self : Transport) -> Unit {
     return
   }
   ffi_transport_init(0)
+  // §12.6 背压配置（须在首个连接建立前下发；默认 256KB/连接、64MB/全栈）
+  ffi_sendq_config(self.cfg.max_send_queue_bytes, self.cfg.send_queue_budget_bytes)
   // 挂接真实回调（捕获 self；MoonBit 闭包编译为普通 JS 函数，可被 FFI 调用）
   self.udp_server_cb = fn(data, host, port) { self.handle_udp(true, data, host, port) }
   self.udp_client_cb = fn(data, host, port) { self.handle_udp(false, data, host, port) }
@@ -212,6 +226,33 @@ fn is_multicast_like(h : @frame.FrameHeader) -> Bool {
   h.code == 0x01 || h.code == 0x02 || (h.ren && h.code == 0x00)
 }
 
+/// 组播候选下的"静默违规"集合（与 Node/C 解析器逐条对齐，§4.4）：
+/// 1) VER 不符 → RST(0x22) 改为静默
+/// 2) UDP 上收到 GetIDL（CTR=1, Code=0x04，传输绑定违规，§7.2）→ 静默
+/// 3) 控制帧 StrmID 语义违规：Code∈{0x03,0x04} 且 StrmID=0；
+///    Code∈{0x00,0x01,0x02} 且 StrmID≠0（取消确认 ACK 例外，§3.7/§8.1）
+/// 其余任何违规一律回 RST(code)，不得无差别静默。
+fn is_silent_violation(h : @frame.FrameHeader, code : Int) -> Bool {
+  // VER 不符（单播回 RST(0x22)）
+  if code == @errors.RST_UNSUPPORTED_VERSION {
+    return true
+  }
+  if !h.ctr {
+    return false
+  }
+  // UDP 上收到 GetIDL（§7.2 仅 TCP 单播）
+  if h.code == 0x04 {
+    return true
+  }
+  if h.code == 0x03 {
+    return h.strm_id == 0
+  }
+  if h.code == 0x00 || h.code == 0x01 || h.code == 0x02 {
+    return h.strm_id != 0 && !(h.typ == @frame.Ack && h.code == 0x00)
+  }
+  false
+}
+
 /// UDP 收包处理（§4.2/§4.3/§4.4）：解析 → 交付 / 回 RST / 静默丢弃
 fn Transport::handle_udp(
   self : Transport,
@@ -224,14 +265,15 @@ fn Transport::handle_udp(
     // §4.3 步骤 8：合法帧交付上层（from_server 标志供上层区分组播候选/单播）
     Ok(frame) => (self.on_event)(UdpFrame(frame, host, port, from_server))
     Reject(code, hdr) => {
-      // §4.4：组播帧静默丢弃。目的地址不可判定 → 用帧头启发式：
-      // Offer/Find/REN 静默；其余（含全部数据帧）回 RST(code)，从收到帧的 socket 发出。
-      // hdr 缺失（无法提取帧头）时沿用 socket 身份判断。
-      let multicast = match hdr {
-        Some(h) => is_multicast_like(h)
-        None => from_server
+      // §4.4：组播帧静默丢弃。目的地址不可判定 → 用帧头启发式，但**静默范围必须与
+      // Node/C 一致**：仅 VER 不符 + 控制帧 StrmID 语义违规静默；其余违规（SvcID/IfID/
+      // InstID/REN 一致性、ACK/RST 形态、控制帧 MSK 等）一律回 RST(code)。
+      // 此前对组播候选的所有 Reject 无差别静默，会漏回本应回 RST 的违规帧。
+      let silent = match hdr {
+        Some(h) => is_multicast_like(h) && is_silent_violation(h, code)
+        None => false // 帧头不可提取 → 无法判定组播，按单播回 RST
       }
-      if !multicast {
+      if !silent {
         let raw = make_rst_frame(code, hdr)
         if raw.length() > 0 {
           let idx = if from_server { self.server_idx } else { self.client_idx }
@@ -296,7 +338,12 @@ pub fn Transport::tcp_connect(self : Transport, host : String, port : Int) -> In
   }
 }
 
-/// TCP 发送帧（编码 + 写流 + 刷新空闲计时；返回是否成功编码）
+/// TCP 发送帧（编码 + 写流 + 刷新空闲计时）
+///
+/// 返回值语义（§12.6 背压，**自本版起扩展**）：Bool 不再只表示"编码成功"，而是
+/// "成功写入/受理"——true = 控制帧已直写或数据帧已进入有界发送队列；
+/// false = 编码失败 **或 数据队列满（本帧一个字节都未写）或连接不存在/已失效**。
+/// 调用方必须检查返回值：数据帧被拒时不得假定已送达（TCP NON 无重传，由上层语义兜底）。
 pub fn Transport::send_tcp_frame(
   self : Transport,
   conn_id : Int,
@@ -310,12 +357,15 @@ pub fn Transport::send_tcp_frame(
   if raw.length() == 0 {
     return false
   }
-  ffi_tcp_write(conn_id, raw)
-  match self.conns.get(conn_id) {
-    Some(conn) => conn.last_send_ms = now_ms()
-    None => ()
+  // §12.6：把 FFI 写入结果透传（队列满 → false 且未写入，不丢帧语义由调用方回滚保证）
+  let ok = ffi_tcp_write(conn_id, raw)
+  if ok {
+    match self.conns.get(conn_id) {
+      Some(conn) => conn.last_send_ms = now_ms()
+      None => ()
+    }
   }
-  true
+  ok
 }
 
 /// 主动关闭连接（不回调 TcpClosed、不自动重连——调用方自行知晓）
@@ -380,16 +430,20 @@ fn Transport::handle_tcp_event(
               TcpReject(code, hdr) => {
                 let raw = make_rst_frame(code, hdr)
                 if raw.length() > 0 {
-                  ffi_tcp_write(conn_id, raw)
-                  conn.last_send_ms = now_ms()
+                  // §12.6：RST 属控制帧（直写）；写失败仅不刷新空闲计时
+                  if ffi_tcp_write(conn_id, raw) {
+                    conn.last_send_ms = now_ms()
+                  }
                 }
               }
-              // §4.1 半帧超时 → RST(0x26)（帧头不可知场景全 0 ID，见 make_rst_frame 注释）
-              TcpRst26 => {
-                let raw = make_rst_frame(@errors.RST_FRAME_TIMEOUT, None)
+              // §4.1 半帧超时 → RST(0x26)（阶段二回显当前帧 StrmID，见 make_rst26_frame）
+              TcpRst26(strm) => {
+                let raw = make_rst26_frame(strm)
                 if raw.length() > 0 {
-                  ffi_tcp_write(conn_id, raw)
-                  conn.last_send_ms = now_ms()
+                  // §12.6：RST 属控制帧（直写）；写失败仅不刷新空闲计时
+                  if ffi_tcp_write(conn_id, raw) {
+                    conn.last_send_ms = now_ms()
+                  }
                 }
               }
               // §4.1 阶段一超时 / 丢弃模式兜底 → 关闭连接（JS 侧尚未删除 → destroy 收尾）
@@ -491,19 +545,32 @@ fn Transport::tick(self : Transport) -> Unit {
         TcpReject(code, hdr) => {
           let raw = make_rst_frame(code, hdr)
           if raw.length() > 0 {
-            ffi_tcp_write(cid, raw)
-            conn.last_send_ms = now
+            // §12.6：RST 属控制帧（直写），写失败仅不刷新空闲计时（连接不可用）
+            if ffi_tcp_write(cid, raw) {
+              conn.last_send_ms = now
+            }
           }
         }
-        TcpRst26 => {
-          let raw = make_rst_frame(@errors.RST_FRAME_TIMEOUT, None)
+        TcpRst26(strm) => {
+          let raw = make_rst26_frame(strm)
           if raw.length() > 0 {
-            ffi_tcp_write(cid, raw)
-            conn.last_send_ms = now
+            if ffi_tcp_write(cid, raw) {
+              conn.last_send_ms = now
+            }
           }
         }
         TcpClose => closes.push(cid)
       }
+    }
+    // §12.6 背压：自首次拒写起持续满 ≥ 2×heartbeat_period → 断连（drain 清空后 fullSince 归零）
+    let full_since = ffi_tcp_sendq_full_since(cid).to_int64()
+    if full_since > 0L && now - full_since >= self.cfg.heartbeat_period_ms * 2L {
+      ffi_sendq_note_closed(0)
+      ffi_log_error(
+        "[transport] 发送队列持续满超过 2×心跳周期，断开连接 conn=\{cid} peer=\{conn.peer}:\{conn.port}",
+      )
+      closes.push(cid)
+      continue
     }
     // §5.7 失效判定：超过 2×heartbeat_period 未收到任何帧 → 标记连接失效销毁
     if now - conn.last_recv_ms >= self.cfg.heartbeat_period_ms * 2L {
@@ -512,8 +579,10 @@ fn Transport::tick(self : Transport) -> Unit {
     }
     // §5.7 空闲判定：超过 heartbeat_period 未发出任何帧 → 发送一次 Ping
     if now - conn.last_send_ms >= self.cfg.heartbeat_period_ms {
-      ffi_tcp_write(cid, ping_frame())
-      conn.last_send_ms = now
+      // §12.6：Ping 属控制帧（直写）；写失败仅不刷新空闲计时
+      if ffi_tcp_write(cid, ping_frame()) {
+        conn.last_send_ms = now
+      }
     }
   }
   // 统一销毁失效连接（on_conn_closed 幂等，重复 cid 无害）

@@ -119,6 +119,8 @@ fn main {
     response_timeout_ms: 2000L,
     retransmit_interval_ms: 200L,
     retransmit_max: 3,
+    max_send_queue_bytes: 262144, // §12.6 背压默认（单连接 256KB / 全栈 64MB）
+    send_queue_budget_bytes: 67108864,
   }
   let stack = @stack.Stack::new(cfg)
   stack.start()

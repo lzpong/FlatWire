@@ -51,6 +51,7 @@ extern "C" {
 #define FW_ERR_IO              -13  // 文件/socket IO 错误
 #define FW_ERR_UNSUPPORTED     -14  // 不支持（float80/整型 size>8）
 #define FW_ERR_STATE           -15  // 状态机不允许的操作
+#define FW_ERR_WOULDBLOCK      -16  // 发送队列已满/暂不可写（实现限制，非协议错误；调用方可退避重试）
 
 // ---- 解码错误细分（codec 层负值，统一映射 RST(0x20)，§9.1/§9.3/§12.1） ----
 #define FW_DEC_UNEXPECTED_NULL      -101  // 值为 null（v5 无 null 编码，字段必填）
@@ -157,6 +158,13 @@ typedef struct {
   uint32_t     tcp_frame_timeout_ms;  // 5000（半帧超时；丢弃模式兜底 = 2×）
   uint32_t     heartbeat_period_ms;   // 30000（仅 TCP）
   uint32_t     max_payload_len;       // 1400（仅 UDP，帧级）
+  uint32_t     max_conns;             // 1024（R3-8：TCP 连接上限，入站/出站统一计数，超限拒绝）
+  // 发送背压（实现限制，非协议语义；0=不限制，仅建议调试/兼容旧行为时使用）：
+  // 单个 TCP 连接「已入队未发出」的数据帧字节上限；控制帧（RST/Ping 等 ≤1024B）不走队列
+  uint32_t     max_send_queue_bytes;  // 262144（256KB）
+  // 全栈数据帧未发字节总预算（防止多连接合计吃光内存；0=不限制）
+  uint32_t     send_queue_budget_bytes; // 67108864（64MB）
+  uint32_t     strm_pool_idle_ms;     // 300000（R3-9：Strm 池空闲回收阈值，5 分钟）
   uint8_t      ver;                   // 0（协议版本 VER）
   const char  *idl_dir;               // "./idl"（IDL 库文件夹，§11.1）
   int          tcp_enabled;           // 1=TCP 监听（客户端角色栈可关，同机双栈演示）
@@ -274,7 +282,8 @@ typedef void (*fw_sp_drop_cb)(void *ud);
 
 struct fw_stream_parser {
   uint8_t *buf;              // 待解析缓冲（分包不丢弃已读字节，§4.1）
-  size_t   len, cap;
+  size_t   len, cap;         // len=有效字节数；有效区间为 buf[off, off+len)
+  size_t   off;              // 有效区间起点：消费只移动 off（避免每帧 memmove → 粘包 O(n²)）
   uint8_t  ver;              // 本端协议版本（§4.3 步骤 1 校验）
   int      receiving;        // 有帧正在接收（帧首字节已到达且未交付）
   int      header_done;      // 当前帧帧头已收齐（≥8B 含 Length/Mask）
@@ -283,6 +292,10 @@ struct fw_stream_parser {
   int      drop_mode;        // 丢弃模式（§4.1 阶段二）
   uint64_t drop_remaining;   // 剩余待丢弃字节 R = L − 已收（可远超 2^32）
   int64_t  drop_last_ms;     // 丢弃模式每收字节刷新计时（兜底超时判定）
+  // 违规帧定界（§4.1）：违规帧已回 RST，但其帧尾字节必须完整消费——若直接清空
+  // 缓冲，帧尾残留会与后续帧首字节拼成"合法"帧（帧走私/帧边界错位）。
+  int      invalid_pending;  // 帧头（含 Length/Mask）未收齐，等待到齐后定界
+  size_t   invalid_head_len; // 违规帧帧头长度（8 + PLB + MSK?4）
   uint8_t *scratch;          // 交付暂存（粘包下 on_frame 回调前解析缓冲会被
   size_t   scratch_cap;      //   memmove 挪动，payload 须拷贝解耦后再消费）
   // 回调（feed 过程中触发）
@@ -454,6 +467,9 @@ void fw_strm_release_server(fw_strm_mgr_t *m, const char *peer, uint16_t svc, ui
 void fw_strm_release_ctrl(fw_strm_mgr_t *m, const char *peer, int strm);
 // 收到 REN=1：清除该对端（peer 前缀，如 "1.2.3.4:"）全部序列（§3.6/§6.3）
 void fw_strm_reset_peer(fw_strm_mgr_t *m, const char *peer_prefix);
+// R3-9：回收空闲 Strm 池（无活跃流且距最近分配/释放 >= idle_ms）。返回回收的池数。
+// 仅回收已空闲的池，不影响活跃流的冷却/序列语义（§6.3）。
+int  fw_strm_sweep(fw_strm_mgr_t *m, int64_t now_ms, uint32_t idle_ms);
 
 // ============================================================
 // SD Entry 编解码（§7.1；多字节整数大端）
@@ -510,6 +526,14 @@ typedef struct {
   char msg[192];
 } fw_result_t;
 
+// 发送队列水位与拒绝统计（实现限制的可观测项，非协议语义）
+typedef struct {
+  size_t   queued_bytes;       // 当前全栈「已入队未发出」的数据帧字节数
+  size_t   peak_bytes;         // 历史峰值
+  uint32_t rejects;            // 因队列满/预算耗尽被拒绝的帧数（FW_ERR_WOULDBLOCK）
+  uint32_t conn_closed_full;   // 因队列持续满超过心跳窗口而主动断连的连接数
+} fw_sendq_stats_t;
+
 // ---- 回调 ----
 // 服务端 rpc 处理（§13.3）：返回 FW_OK 且 *out 置响应值（所有权转移协议栈）；
 // 返回非 0 → RST(0x30) Internal Error
@@ -543,6 +567,8 @@ void fw_stack_run(fw_stack_t *st);     // 循环 poll 直到 fw_stack_stop
 void fw_stack_stop(fw_stack_t *st);    // REN×3 组播（~100ms 间隔，先发后关 §3.6）→ 释放资源
 void fw_stack_free(fw_stack_t *st);
 const fw_result_t *fw_stack_last_error(const fw_stack_t *st);
+// 读取发送队列水位/拒绝计数（实现限制，非协议合规项；out 为输出参数，无副作用）
+void fw_stats_sendq(const fw_stack_t *st, fw_sendq_stats_t *out);
 // 注入虚假时钟（测试专用；NULL 恢复真实时钟）
 void fw_set_clock_override(int64_t (*fn)(void));
 

@@ -183,6 +183,18 @@ test "broken idl raises" {
   }
 }
 
+/// §3.5/§11.1：同一服务内 IfID 必须唯一（重复 → 加载失败）
+test "duplicate if_id rejected" {
+  let dup =
+    "{\"service\":{\"name\":\"D\",\"svc_id\":2,\"major_ver\":1,\"minor_ver\":0,\"interfaces\":[{\"name\":\"A\",\"if_id\":7,\"type\":\"ff\"},{\"name\":\"B\",\"if_id\":7,\"type\":\"ff\"}]}}"
+  assert_true(parse_fails(dup))
+  // 唯一 IfID 的等价 IDL 正常解析（确保校验不误伤）
+  let uniq =
+    "{\"service\":{\"name\":\"D\",\"svc_id\":2,\"major_ver\":1,\"minor_ver\":0,\"interfaces\":[{\"name\":\"A\",\"if_id\":7,\"type\":\"ff\"},{\"name\":\"B\",\"if_id\":8,\"type\":\"ff\"}]}}"
+  let def = parse_ok(uniq)
+  assert_eq(def.interfaces.length(), 2)
+}
+
 /// IdlStore 内存组织：多版本并存不覆盖 + get_any 取最高版本
 test "idl store versioning" {
   let store = IdlStore::new("unused_dir")

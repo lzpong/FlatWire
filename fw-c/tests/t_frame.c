@@ -190,6 +190,24 @@ int suite_frame(void) {
   CHECK_EQ_INT(h5.code, FW_CODE_SD_GETIDL);
   TEST_END();
 
+  TEST_BEGIN("2.17b 控制帧 ACK(0x10)/GetIDL 响应(0x11) StrmID=0 不判违规（口径定案）");
+  opts(&o, 1);
+  // 控制帧没有"流"概念：StrmID=0 表示不绑定流（§4.3 步骤 4 例外二）
+  // TYP=ACK(2) + Code=0x10 + CTR=1 + PLB=0 → byte1 = (2<<6)|0x10 = 0x90
+  uint8_t ea1[] = {0x80, 0x90, 0, 0, 0, 0, 0, 0x00};
+  CHECK_EQ_INT(fw_parse_datagram(ea1, 8, &o, &fr, &rst), FW_PARSE_OK);
+  // 控制帧 ACK 的 StrmID 范围仍受限：0x80 保留 → RST(0x00)
+  uint8_t ea2[] = {0x80, 0x90, 0, 0, 0, 0, 0, 0x80};
+  CHECK_EQ_INT(fw_parse_datagram(ea2, 8, &o, &fr, &rst), FW_PARSE_INVALID);
+  // GetIDL 响应(0x11)：TCP 上 StrmID=0 合法（不绑定流）
+  uint8_t er1[] = {0x80, 0x11, 0, 0, 0, 0, 0, 0x00};
+  CHECK_EQ_INT(fw_parse_header(er1, 8, 0, &o_tcp, &h5), FW_PARSE_OK);
+  CHECK_EQ_INT(h5.code, 0x11);
+  // 同一帧在 UDP 上必须拒绝（传输绑定约束 §7.2，与 StrmID 校验无关）
+  CHECK_EQ_INT(fw_parse_datagram(er1, 8, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
+  TEST_END();
+
   TEST_BEGIN("2.18 数据帧 StrmID 越界（0x00/0xFF）");
   opts(&o, 1);
   uint8_t t1[] = {0x00, 0x01, 0, 1, 0, 1, 1, 0x00};
@@ -251,6 +269,15 @@ int suite_frame(void) {
   CHECK_EQ_INT(fw_parse_datagram(x10, 8, &o, &fr, &rst), FW_PARSE_OK);
   CHECK_EQ_INT(fr.typ, FW_TYP_ACK);
   CHECK_EQ_INT(fr.strm_id, 0xFE);
+  // §3.7/§8.1 例外：Subscribe(TTL=0) 取消确认 ACK(Code=0x00, CTR=1) 回显会话 StrmID
+  uint8_t x12[] = {0x80, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05};
+  CHECK_EQ_INT(fw_parse_datagram(x12, 8, &o, &fr, &rst), FW_PARSE_OK);
+  CHECK_EQ_INT(fr.typ, FW_TYP_ACK);
+  CHECK_EQ_INT(fr.strm_id, 0x05);
+  // 心跳 Ping（CTR=1、TYP=NON、Code=0x00）携带 StrmID≠0 → 步骤 4 违规
+  uint8_t x13[] = {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05};
+  CHECK_EQ_INT(fw_parse_datagram(x13, 8, &o, &fr, &rst), FW_PARSE_INVALID);
+  CHECK_EQ_INT(rst.rst_code, FW_RST_VIOLATION);
   TEST_END();
 
   TEST_BEGIN("2.21 TCP 收 CON/ACK → RST(0x00) + 2.29 控制帧 MSK=1");
@@ -307,6 +334,29 @@ int suite_frame(void) {
   CHECK_EQ_INT(fw_parse_datagram(buf, n2, &om, &fr2, &rm), FW_PARSE_OK);
   CHECK_EQ_INT(fr2.msk, 1);
   CHECK_EQ_MEM(fr2.payload, pl, 3); // XOR 还原一致
+  TEST_END();
+
+  TEST_BEGIN("轮A MSK 全 FF 密钥 + 单字节帧 + ID 极值");
+  {
+    // 全 FF 密钥 + 1B payload + ID 极值（SvcID/IfID=0xFFFF、InstID=0xFF、StrmID=0xFE）
+    // 0x00 ^ 0xFF = 0xFF 编码，解码须还原原文；单字节 payload 走 PLB=1 边界
+    uint8_t pl1[1] = {0x00};
+    uint8_t mf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    fw_frame_desc_t d1 = fdesc(0, FW_TYP_NON, FW_CODE_REQUEST, 0xFFFF, 0xFFFF, 0xFF, 0xFE, pl1, 1);
+    d1.msk = 1;
+    d1.mask_key = mf;
+    uint32_t n1 = fw_frame_encode(buf, sizeof(buf), &d1);
+    CHECK_EQ_INT(n1, 8 + 1 + 4 + 1);
+    fw_frame_t f1;
+    fw_head_res_t r1;
+    CHECK_EQ_INT(fw_parse_datagram(buf, n1, &om, &f1, &r1), FW_PARSE_OK);
+    CHECK_EQ_INT(f1.svc_id, 0xFFFF);
+    CHECK_EQ_INT(f1.if_id, 0xFFFF);
+    CHECK_EQ_INT(f1.inst_id, 0xFF);
+    CHECK_EQ_INT(f1.strm_id, 0xFE);
+    CHECK_EQ_INT(f1.payload_len, 1);
+    CHECK_EQ_INT(f1.payload[0], 0x00); // 全 FF 密钥 XOR 往返
+  }
   TEST_END();
 
   return 0;

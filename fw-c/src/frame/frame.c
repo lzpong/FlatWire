@@ -166,8 +166,9 @@ fw_parse_state_t fw_parse_header(const uint8_t *buf, size_t avail, size_t offset
     fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr);
     return FW_PARSE_INVALID;
   }
-  // GetIDL 仅走 TCP 单播（§7.2）：UDP 上收到 → RST(0x00)，组播帧静默丢弃
-  if (o->is_udp && ctr == 1 && code == 0x04) {
+  // GetIDL 查询(0x04) 与 GetIDL 响应(0x11) 仅走 TCP 单播（§7.2）：
+  // UDP 上收到 → RST(0x00)，组播帧静默丢弃
+  if (o->is_udp && ctr == 1 && (code == 0x04 || code == 0x11)) {
     if (o->multicast_like) return FW_PARSE_SILENT;
     fill_rst(out, FW_RST_VIOLATION, buf, avail, ctr);
     return FW_PARSE_INVALID;
@@ -317,18 +318,35 @@ void fw_sp_free(fw_stream_parser_t *p) {
   free(p->buf);
   p->buf = NULL;
   p->len = p->cap = 0;
+  p->off = 0;
   free(p->scratch); // 交付暂存缓冲（粘包解耦，§4.1）
   p->scratch = NULL;
   p->scratch_cap = 0;
 }
 
+// 压实：把有效区间搬回缓冲起点（仅当 off 已过半且非零时才做，搬迁总代价摊销 O(n)）
+static void sp_compact(fw_stream_parser_t *p) {
+  if (p->off == 0 || p->len == 0) return;
+  memmove(p->buf, p->buf + p->off, p->len);
+  p->off = 0;
+}
+
 static void sp_consume(fw_stream_parser_t *p, size_t n) {
   if (n >= p->len) {
     p->len = 0;
+    p->off = 0; // 缓冲已空，游标归零（容量保留复用）
+    // 大缓冲不常驻：一次性大帧（如 1MB IDL 响应）处理完后释放，避免长连接长期占峰
+    if (p->cap > 65536) {
+      free(p->buf);
+      p->buf = NULL;
+      p->cap = 0;
+    }
     return;
   }
-  memmove(p->buf, p->buf + n, p->len - n);
+  p->off += n;
   p->len -= n;
+  // 消费过半才压实：避免每帧 memmove 造成粘包 O(n²)
+  if (p->off >= 4096 && p->off >= p->len) sp_compact(p);
 }
 
 // 丢弃模式字节消耗（§4.1：精确丢弃 R 字节，收满恢复 IDLE）
@@ -348,23 +366,59 @@ static void sp_consume_drop(fw_stream_parser_t *p) {
 
 static void sp_loop(fw_stream_parser_t *p);
 
+// 违规帧定界（§4.1）：违规帧已回 RST，但帧尾字节必须完整消费——若直接清空缓冲，
+// 帧尾残留会与后续帧首字节拼成"合法"帧（帧走私/帧边界错位）。
+// 调用前置条件：p->len >= invalid_head_len（帧头含 Length/Mask 已到齐）。
+// 返回 1=已定界（可继续解析）；0=帧头未齐，需等待更多字节。
+static int sp_resolve_invalid(fw_stream_parser_t *p) {
+  if (p->len < p->invalid_head_len) return 0; // 帧头未齐：保留缓冲等待
+  uint8_t b0 = p->buf[p->off];
+  int plb = b0 & 0x07;
+  uint64_t plen = 0;
+  for (int i = 0; i < plb; i++) plen = (plen << 8) | p->buf[p->off + 8 + i];
+  // 64 位定界：total 用 uint64，避免 32 位平台 size_t 溢出后误判已收齐
+  uint64_t total = (uint64_t)p->invalid_head_len + plen;
+  p->invalid_pending = 0;
+  p->invalid_head_len = 0;
+  p->header_done = 0;
+  p->received = 0;
+  if ((uint64_t)p->len >= total) {
+    sp_consume(p, (size_t)total); // 跳过整个违规帧，继续解析后续帧
+    p->receiving = 0;
+    return 1;
+  }
+  // 帧尾未到齐：进入丢弃模式，剩余 R = L − 已收 从后续字节精确消耗（§4.1 阶段二）
+  p->drop_mode = 1;
+  p->drop_remaining = total - (uint64_t)p->len;
+  p->drop_last_ms = fw_now_ms();
+  p->receiving = 0;
+  p->len = 0; // 已收的当前帧字节全部作废
+  p->off = 0;
+  return 1;
+}
+
 // 返回 FW_OK / FW_ERR_MEMORY：realloc 失败不再静默丢 chunk（返回状态
 // 供连接层决策；旧调用点忽略返回值仍兼容——签名由 void 改 int）
 int fw_sp_feed(fw_stream_parser_t *p, const uint8_t *chunk, size_t n) {
   // 追加到待解析缓冲（分包不丢弃已读字节，§4.1）
-  if (p->len + n > p->cap) {
-    size_t nc = p->cap ? p->cap : 1024;
-    while (nc < p->len + n) nc *= 2;
-    uint8_t *nb = (uint8_t *)realloc(p->buf, nc);
-    if (!nb) {
-      fw_log(FW_LOG_ERROR, "frame", "sp_feed realloc failed (%zu bytes buffered, %zu dropped)",
-             p->len, n); // 失败显式记日志（原静默丢弃仅半帧超时兜底）
-      return FW_ERR_MEMORY;
+  // 必须按 off+len+n 判断容量：有效区间尾部 = off + len，忽略 off 会写越界
+  if (p->off + p->len + n > p->cap) {
+    // 尾部空间不足：先压实腾出前部已消费空间（避免无谓扩容），再按需几何扩容
+    if (p->off > 0) sp_compact(p);
+    if (p->len + n > p->cap) {
+      size_t nc = p->cap ? p->cap : 1024;
+      while (nc < p->len + n) nc *= 2;
+      uint8_t *nb = (uint8_t *)realloc(p->buf, nc);
+      if (!nb) {
+        fw_log(FW_LOG_ERROR, "frame", "sp_feed realloc failed (%zu bytes buffered, %zu dropped)",
+               p->len, n); // 失败显式记日志（原静默丢弃仅半帧超时兜底）
+        return FW_ERR_MEMORY;
+      }
+      p->buf = nb;
+      p->cap = nc;
     }
-    p->buf = nb;
-    p->cap = nc;
   }
-  memcpy(p->buf + p->len, chunk, n);
+  memcpy(p->buf + p->off + p->len, chunk, n);
   p->len += n;
   sp_loop(p);
   return FW_OK;
@@ -375,6 +429,14 @@ static void sp_loop(fw_stream_parser_t *p) {
   if (p->drop_mode) {
     sp_consume_drop(p);
     if (p->drop_mode) return; // 仍在丢弃模式且未收满
+  }
+  // 违规帧帧头到齐后定界（RST 已在首次判定时回复，此处不重复）
+  if (p->invalid_pending) {
+    if (!sp_resolve_invalid(p)) return; // 帧头仍未到齐：等待
+    if (p->drop_mode) {
+      sp_consume_drop(p);
+      if (p->drop_mode) return;
+    }
   }
   // 逐帧解析（粘包逐帧交付，§4.1）
   for (;;) {
@@ -396,37 +458,22 @@ static void sp_loop(fw_stream_parser_t *p) {
     o.max_payload_len = 0xFFFFFFFFu; // TCP 无 max_payload_len 约束（§2）
     o.multicast_like = 0;
     fw_head_res_t h;
-    fw_parse_state_t st = fw_parse_header(p->buf, p->len, 0, &o, &h);
+    fw_parse_state_t st = fw_parse_header(p->buf + p->off, p->len, 0, &o, &h);
     if (st == FW_PARSE_NEED_MORE) return; // 分包：保存状态等待（§4.1）
 
     if (st == FW_PARSE_INVALID) {
-      // 违规帧：回 RST。若能读出声明帧总长则精确跳过该帧继续解析；无法定界则清空缓冲
+      // 违规帧：立即回 RST（同一违规帧只回一次）。随后必须按声明长度定界：
+      // 帧头未齐先等待，到齐后跳过整帧或进入丢弃模式（防止帧尾与后续帧拼接）。
       if (p->on_rst) p->on_rst(p->ud, h.rst_code, &h);
-      uint8_t b0 = p->buf[0];
-      int plb = b0 & 0x07;
-      int has_msk = ((b0 >> 3) & 1) == 1;
-      size_t head_len = (size_t)(8 + plb + (has_msk ? 4 : 0));
-      int skipped = 0;
-      if (p->len >= head_len) {
-        uint64_t plen = 0;
-        for (int i = 0; i < plb; i++) plen = (plen << 8) | p->buf[8 + i];
-        // 64 位比较，避免 32 位平台 size_t 溢出后误判"已收齐"并跳过错误字节数
-        uint64_t total = (uint64_t)head_len + plen;
-        if ((uint64_t)p->len >= total) {
-          sp_consume(p, (size_t)total); // 跳过违规帧，继续解析后续帧
-          p->receiving = 0;
-          p->header_done = 0;
-          skipped = 1;
-        }
+      p->invalid_pending = 1;
+      p->invalid_head_len = (size_t)(8 + (p->buf[p->off] & 0x07) +
+                                     (((p->buf[p->off] >> 3) & 1) ? 4 : 0));
+      if (!sp_resolve_invalid(p)) return; // 帧头未齐：等后续字节
+      if (p->drop_mode) {
+        sp_consume_drop(p);
+        if (p->drop_mode) return; // 未收满，等待
       }
-      if (!skipped) {
-        // 无法定界（Payload Length 值未到齐）：清空缓冲（违规帧尾无法重同步）
-        p->len = 0;
-        p->receiving = 0;
-        p->header_done = 0;
-        return;
-      }
-      continue;
+      continue; // 已跳过整帧，继续解析后续帧
     }
 
     // FW_PARSE_OK：帧头已解析，等 Payload
@@ -474,7 +521,7 @@ static void sp_loop(fw_stream_parser_t *p) {
         p->scratch = ns;
         p->scratch_cap = nc;
       }
-      memcpy(p->scratch, p->buf + h.header_len, (size_t)h.payload_len);
+      memcpy(p->scratch, p->buf + p->off + h.header_len, (size_t)h.payload_len);
       if (h.msk) {
         // MSK=1：XOR 还原（在暂存副本上执行，§10 编解码对称）
         fw_mask_xor(p->scratch, (size_t)h.payload_len, h.mask_key);
@@ -489,7 +536,9 @@ static void sp_loop(fw_stream_parser_t *p) {
   }
 }
 
-int fw_sp_receiving(const fw_stream_parser_t *p) { return p->receiving || p->drop_mode; }
+int fw_sp_receiving(const fw_stream_parser_t *p) {
+  return p->receiving || p->drop_mode || p->invalid_pending;
+}
 
 int fw_sp_header_complete(const fw_stream_parser_t *p) { return p->header_done; }
 
@@ -507,7 +556,9 @@ uint64_t fw_sp_enter_drop_mode(fw_stream_parser_t *p, int64_t now_ms) {
   p->drop_last_ms = now_ms; // 兜底计时起点（每收字节刷新，§4.1 退出条件 3）
   p->receiving = 0;
   p->header_done = 0;
+  p->invalid_pending = 0; // 违规帧定界状态与丢弃模式互斥，进入丢弃即清理
   p->received = 0;
   p->len = 0; // 已收的当前帧字节全部作废
+  p->off = 0;
   return p->drop_remaining;
 }

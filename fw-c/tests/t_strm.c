@@ -69,5 +69,46 @@ int suite_strm(void) {
   fw_strm_free(m);
   TEST_END();
 
+  TEST_BEGIN("REN 同时清除冷却记录与分配游标（§3.6/§6.3）");
+  fw_strm_mgr_t *m3 = fw_strm_new();
+  {
+    int x1 = fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1); // 0x01
+    int x2 = fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1); // 0x02
+    int x3 = fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1); // 0x03
+    int x4 = fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1); // 0x04
+    CHECK_EQ_INT(x1, 0x01); CHECK_EQ_INT(x2, 0x02);
+    CHECK_EQ_INT(x3, 0x03); CHECK_EQ_INT(x4, 0x04);
+    fw_strm_release_client(m3, "4.4.4.4:5400", 1, 1, x2);
+    fw_strm_release_client(m3, "4.4.4.4:5400", 1, 1, x4);
+    CHECK_EQ_INT(fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1), 0x02); // 未冷却 → fallback
+    CHECK_EQ_INT(fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1), 0x04); // 冷却命中
+    // REN=1：对端重启 → 冷却记录与游标一并清除
+    fw_strm_reset_peer(m3, "4.4.4.4:");
+    CHECK_EQ_INT(fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1), 0x01); // 修复前会命中残留冷却的 0x02
+    CHECK_EQ_INT(fw_strm_alloc_client(m3, "4.4.4.4:5400", 1, 1), 0x02);
+  }
+  fw_strm_free(m3);
+  TEST_END();
+
+  TEST_BEGIN("R3-9 Strm 池空闲回收：只回收全空闲且已过期池（保冷却/序列语义）");
+  fw_strm_mgr_t *m4 = fw_strm_new();
+  {
+    int y1 = fw_strm_alloc_client(m4, "5.5.5.5:5400", 1, 1); // 0x01
+    CHECK_EQ_INT(y1, 0x01);
+    // 有活跃流 → 任何阈值下都不得回收
+    CHECK_EQ_INT(fw_strm_sweep(m4, fw_now_ms() + 100000, 1), 0);
+    fw_strm_release_client(m4, "5.5.5.5:5400", 1, 1, y1);
+    // 未到空闲阈值（now 未推进）→ 不回收，冷却记录保留
+    CHECK_EQ_INT(fw_strm_sweep(m4, fw_now_ms(), 60000), 0);
+    // 推进 60s 且阈值 60s → 回收该池
+    CHECK_EQ_INT(fw_strm_sweep(m4, fw_now_ms() + 60000, 60000), 1);
+    // 重建池：回到初始态，从池首分配（回收仅发生在池完全空闲之后，不破坏冷却/序列语义）
+    CHECK_EQ_INT(fw_strm_alloc_client(m4, "5.5.5.5:5400", 1, 1), 0x01);
+    // 其它对端不受影响（sweep 后仍按各自池首分配）
+    CHECK_EQ_INT(fw_strm_alloc_client(m4, "6.6.6.6:5400", 1, 1), 0x01);
+  }
+  fw_strm_free(m4);
+  TEST_END();
+
   return 0;
 }

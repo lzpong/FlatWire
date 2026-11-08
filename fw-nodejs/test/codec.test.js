@@ -505,6 +505,19 @@ test('1.5 string/bytes/array 缺 fixed_len/max_len → IDL 加载失败', () => 
   assert.equal(ok.resolveType('S').fields[0].type, 'string');
 });
 
+// §3.5/§11.1：同一服务内 IfID 必须唯一（MUST）——重复会让 Map 静默覆盖前一条定义
+test('§3.5/§11.1 同一服务内 IfID 必须唯一（重复 → 加载失败）', () => {
+  const ifc = (name, id) => ({ name, if_id: id, type: 'ff', transport: 'tcp', input: [] });
+  const idl = (interfaces) => ({
+    service: { name: 'D', svc_id: 2, major_ver: 1, minor_ver: 0, interfaces },
+    type_def: {},
+  });
+  assert.throws(() => new Schema(idl([ifc('A', 7), ifc('B', 7)]), /duplicate if_id 7 in service/));
+  // 唯一 IfID 的等价 IDL 正常加载（确保校验不误伤）
+  const ok = new Schema(idl([ifc('A', 7), ifc('B', 8)]));
+  assert.equal(ok.interfaces.size, 2);
+});
+
 test('1.5 v5 语法：optional / size / width / legacy type / arrays.type 均拒绝', () => {
   assert.throws(
     () => new Schema(mkIdl({ structs: { S: [{ name: 's', type: 'string', max_len: 8, optional: true }] } })),
