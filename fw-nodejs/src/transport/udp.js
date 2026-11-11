@@ -26,8 +26,8 @@ export function isMulticastLike(buf) {
   return (buf[0] & 0x40) !== 0 && code === 0x00;   // REN（CTR=1、REN=1、Code=0）
 }
 
-// 收集本机 IPv4 地址集合（自我回环过滤用）
-function localIpv4Set() {
+// 收集本机 IPv4 地址集合（自我回环过滤用；SD 层 §7.2 自身 Offer 判定复用）
+export function localIpv4Set() {
   const set = new Set(['127.0.0.1', 'localhost']);
   for (const list of Object.values(os.networkInterfaces())) {
     for (const ni of list ?? []) {

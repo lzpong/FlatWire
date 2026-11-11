@@ -76,12 +76,14 @@ fw-c/
 | --- | --- | --- |
 | §2 部署 | 组播双 socket、IP_MULTICAST_LOOP、客户端临时端口、启动 Find 预热、组播不可用单播 Find 降级 | `transport/udp.c` + `stack.c` + `sd/discovery.c` |
 | §3 帧格式 | 8B 帧头（CTR/REN/VER/MSK/PLB、TYP/Code、SvcID/IfID、InstID/StrmID）、PLB/Length 大端 | `frame/frame.c` |
+| §3.2 Length 64 位 | PLB=0~7，最长 7B 大端 Length（协议上限 2^56−1）；解析器内部以 `uint64_t` 累计、不截断宽度；交付结构 `fw_frame_desc_t.payload_len` 为 uint32（本实现承载上限 2^32−1，超限显式丢弃而非截断交付） | `frame/frame.c`（`payload_len` uint64_t 局部变量）、`fw.h`（`fw_frame_desc_t.payload_len` uint32） |
+| §3.5 IfID 类型分区（SHOULD） | 仅要求 `if_id ∈ 0x0001~0xFFFF` 且服务内唯一；`0x0001~0x7FFF` rpc/ff、`0x8000~0xFFFF` event 仅为建议，**不因区间不符拒绝帧或 IDL** | `codec/schema.c` |
 | §4.1 TCP 流式 | 半帧两阶段（<8B 关连接 / 丢弃模式 R=L−已收、字节刷新计时、兜底 2×） | `frame/frame.c`（stream parser）+ `transport/tcp.c` |
-| §4.2/§4.3 解析 | UDP 报文长度校验、十步解析矩阵（MSK=0/VER/REN/TYP/Code/ID/StrmID 语义/0x23） | `frame/frame.c`（parse_header/datagram） |
+| §4.2/§4.3 解析 | UDP 报文长度校验、十步解析矩阵（MSK=0/VER/REN/TYP/Code/ID/StrmID 语义/0x23）；**TYP=RST 跳过步骤 3/4 的 ID 校验（不区分 CTR）**，数据帧 ACK 不豁免 | `frame/frame.c`（parse_header/datagram） |
 | §5.1/§5.2 RPC | Request/Response（回显 StrmID）、fire_forget、TCP 全 NON | `rpc/rpc.c` |
 | §5.5 重传 | CON 重传 0/200/600/1400ms、3000ms 静默停止、响应缓存去重、重复 CON 重发确认 | `rpc/retransmit.c` + `rpc/rpc.c` + `sd/discovery.c` |
-| §5.6/§5.7 TCP | 长连接复用、心跳（仅 TCP、30s Ping、2×period 失效）、自动重连 | `transport/tcp.c` |
-| §6 StrmID | 数据帧 0x01~0xFE / 控制帧 0x00+0x01~0x7F 同池、释放冷却、回绕、REN 清对端 | `strm.c` |
+| §5.6/§5.7 TCP | 长连接复用、心跳（仅 TCP、30s Ping、2×period 失效）、自动重连；连接数上限 `max_conns`（入站/出站统一计数，超限拒绝） | `transport/tcp.c` |
+| §6 StrmID | 数据帧 0x01~0xFE / 控制帧 0x00+0x01~0x7F 同池、释放冷却、回绕、REN 清对端、**池空闲回收**（`strm_pool_idle_ms`） | `strm.c` + `stack.c` |
 | §7 SD | 四操作 Entry（Offer 6B/Find 4B/Subscribe 7B/GetIDL 3B）、Offer 拆帧、Find 响应、状态机、自动重订阅 | `sd/entries.c` + `sd/discovery.c` |
 | §7.2 GetIDL | 仅 TCP 单播、双角色统一触发、落盘持久化、Payload≠3B→0x20、无定义→0x24 | `sd/discovery.c` + `idlstore/store.c` |
 | §8 事件 | Subscribe(CON/NON)、ACK(0x10)/ACK(0x00)、全量推送、tcp-event 预建连接、逐 Entry 处理 | `sd/discovery.c` + `events/events.c` |
@@ -90,12 +92,13 @@ fw-c/
 | §11.1 IDL | 纯动态加载、type_def 三处定义、transport 绑定、事件组、损坏文件跳过 | `codec/schema.c` + `idlstore/store.c` |
 | §12 错误码 | 两层两码：帧级 0x23（仅 UDP）/ IDL 级 0x20；RST 码表与名称 | `logger.c`（fw_rst_name）+ 各模块 |
 | §13 应用 API | register_service/call/call_async/fire_forget/subscribe/unsubscribe/notify/find_service/is_available | `stack.c` |
+| §12.6 发送背压（实现限制） | 数据帧有界队列（单连接 256KB / 全栈 64MB）、控制帧直写（≤1024B 不占配额，阈值为常量不可配置）、满即拒写且一字节不写、持续满 2×心跳周期断连；全栈预算为 **O(1) 增量计数** `sendq_bytes`（入队加 / flush 与关闭归还），对账函数 `fw_int_sendq_consistent`（测试用，O(连接数)） | `transport/tcp.c` |
 | §3.6 生命周期 | stop 发 REN×3（间隔 100ms）先发后关；REN 清缓存/重传记录/StrmID 序列 | `stack.c` + 各模块 |
 | 附录 A 参数 | 全部配置默认值（时间 ms） | `stack.c`（fw_config_defaults）+ `fw.h`（fw_config_t） |
 
 ## 测试
 
-`ctest --test-dir build`（或 `build\fw_tests.exe`）——12 个套件、77 项用例，用例编号对齐《Test Cases.v5.md》：
+`ctest --test-dir build`（或 `build\fw_tests.exe`）——12 个套件、99 项用例，用例编号对齐《Test Cases.v5.md》：
 
 | 套件 | 覆盖 |
 | --- | --- |
@@ -104,11 +107,11 @@ fw-c/
 | t_codec | 1.6~1.38：§9 裸字节全类型往返、值域/字节不足、bool 严格、timestamp 6B、定长无前缀/变长前缀宽度、嵌套、enum 负值/未知值透传、CRC 缺省与开启、末尾字段忽略、大端、MSK |
 | t_frame | 1.1/1.3/1.4/1.32 帧头往返 + 2.6~2.21/2.29 解析矩阵（REN/ACK/RST/SvcID/StrmID 语义/VER/UDP GetIDL/MSK=1） |
 | t_stream | 2.1~2.4 粘包/分包/Length·Mask 跨包 + 2.22~2.24 丢弃模式（解析器层） |
-| t_strm | 4.1/4.2 StrmID 循环/隔离/冷却/REN 重置 |
+| t_strm | 4.1/4.2 StrmID 循环/隔离、§6.1 服务端流与同池、§6.3 冷却、§3.6 REN 清对端与游标、R3-9 池空闲回收 |
 | t_entries | 5.5/5.6 SD Entry 编解码与容量 |
-| t_schema | §11.1 v5 IDL 解析：类型白名单、enum base、fixed_len/max_len 强制（缺失拒绝）、拒绝 optional/size/width、f80 拒绝、嵌套往返、9.1 末尾新增字段容忍 |
+| t_schema | §11.1 v5 IDL 解析：类型白名单、enum base、fixed_len/max_len 强制（缺失拒绝）、拒绝 optional/size/width、f80 拒绝、嵌套往返、9.1 末尾新增字段容忍、IfID 同服务唯一 |
 | t_retrans | 3.10~3.12 重传时间线（注入时钟）、3.7 取消、4.5 REN 清记录 |
-| t_tcp | 2.5/2.22/2.23/2.26/2.28：真实 socket 半帧两阶段全场景 |
+| t_tcp | 2.5/2.22/2.23/2.25/2.26/2.30 真实 socket 半帧两阶段；R3-6 连接表扩容失败回滚；R3-8 连接上限（`max_conns=2` 第 3 条被拒）；R3-C 300 并发建连无 fd 泄漏；BP-1 单连接队列满拒写、BP-3 持续满断连；**BP-4 全栈预算分支**（两条真实连接，第二条自身远低于单连接上限即撞预算并 `FW_ERR_WOULDBLOCK`，每步 `fw_int_sendq_consistent` 对账一致，预算满时控制帧仍直写） |
 | t_integration | 8.1~8.3/5.21/5.28/6.1/6.5/4.4：单进程双栈回环全链路（发现→GetIDL 落盘→call→ff→订阅确认→推送→取消→REN 清缓存→重启本地命中） |
 | t_regress | 6.5 订阅取消 StrmID 回收（130 轮）、5.11 批量 Offer 全量发现、3.19~3.23 心跳、5.22/5.34 GetIDL 场景、5.30 版本并存、5.36 启动预热、6.2/6.10/6.16 订阅确认链路 |
 
@@ -122,7 +125,11 @@ fw-c/
 4. `[VERIFY-4]` fire_forget UpdateState/UploadBlob（TCP）
 5. `[VERIFY-5]` 订阅确认（ACK 0x10）+ 事件推送交付
 
-参数：`fw_node_a [port] [bind]` / `fw_node_b [port] [bind]`（默认 5400 / 127.0.0.1·127.0.0.2，同机演示绑定不同回环地址）。NodeA 支持 `Ctrl+C` 优雅退出（REN×3 后释放资源）。
+参数：`fw_node_a [port] [bind] [--run-for <ms>]` / `fw_node_b [port] [bind]`（默认 5400 / 127.0.0.1·127.0.0.2，同机演示绑定不同回环地址）。NodeA 支持 `Ctrl+C` 或 `--run-for` 到期优雅退出（REN×3 后释放资源）；`--run-for` 供编排脚本收尾，避免只能靠 kill 留下脏进程。示例将 `period_ms/ttl_ms` 调为 1000/2000（演示加速），库默认仍为 2000/4000（见下表）。
+
+**关于 stdout 无缓冲**：两个示例在 `main` 起始调用 `setvbuf(stdout, NULL, _IONBF, 0)`。stdout 重定向到管道/文件时 MSVC CRT 按**全缓冲**处理，且 `_IOLBF` 对管道不生效——就绪行 `[NodeA] stack started` 会直到进程退出才落盘，依赖该行做就绪判定的编排脚本（`scripts/interop.mjs`）会把"已退出的 A"误判为就绪。**请勿改回 `_IOLBF`**。
+
+跨栈互通：仓库根目录 `node scripts/interop.mjs`（前置构建见根 README；脚本会驱动 `build\fw_node_a.exe` / `build\fw_node_b.exe`）。
 
 ## 配置参数（附录 A 默认值）
 
@@ -135,8 +142,13 @@ fw-c/
 | `response_timeout_ms` | 2000 | 响应/GetIDL 查询超时（调用的唯一终态） |
 | `retransmit_interval_ms` / `retransmit_max` | 200 / 3 | CON 重传（0/200/600/1400ms） |
 | `tcp_frame_timeout_ms` | 5000 | TCP 半帧超时（丢弃模式兜底 = 2×） |
-| `heartbeat_period_ms` | 30000 | TCP 心跳（仅 TCP） |
-| `max_payload_len` | 1400 | UDP 帧级 Payload 上限（超限 → RST(0x23)） |
+| `heartbeat_period_ms` | 30000 | TCP 心跳（仅 TCP）；失效阈值固定为 2×period（本实现不提供独立覆盖项） |
+| `heartbeat_timeout_ms` | — | **本实现未提供**：失效判定固定 2×`heartbeat_period_ms`（fw-nodejs 支持该覆盖项，显式值直接替换阈值） |
+| `max_payload_len` | 1400 | UDP 帧级 Payload 上限（超限 → RST(0x23)）；TCP 不受此项限制 |
+| `max_conns` | 1024 | TCP 连接数上限（入站/出站统一计数，超限拒绝新连接） |
+| `max_send_queue_bytes` | 262144 | 单连接数据帧未发字节上限（0=不限制，§12.6 实现限制） |
+| `send_queue_budget_bytes` | 67108864 | 全栈数据帧未发字节总预算（0=不限制；O(1) 增量计数判定） |
+| `strm_pool_idle_ms` | 300000 | StrmID 池空闲回收阈值（0=不回收） |
 | `ver` | 0 | 协议版本 VER（不匹配 → RST(0x22)） |
 | `idl_dir` | ./idl | IDL 库文件夹（`{svc_id}_v{major_ver}.json`） |
 | `tcp_enabled` | 1 | TCP 监听开关（客户端角色栈可关） |
@@ -146,14 +158,15 @@ fw-c/
 
 以下为 C 实现有意/无奈的行为差异（已在代码注释标注条款出处）：
 
-1. **组播成员挂默认接口（INADDR_ANY）**：Windows 绑定回环地址（127.0.0.x）的接口无法承载组播，成员关系统一挂默认接口（否则组播帧无法本机投递）；fw-nodejs 按 `bind_address` 指定成员接口。跨机部署两者等价。
-2. **组播不可用时的单播 Find 降级窗口**：Expired 记录保留 60×period 期间向最近已知地址周期单播 Find（§2 认可的降级路径，行为与组播发现等价）；fw-nodejs 无此兜底（依赖组播）。
-3. **单进程双栈集成测试的调用模式**：`fw_call`/`fw_fire_forget` 等同步 API 的内部泵只驱动本栈（被叫栈需自身事件循环）——单进程双栈场景须用 `fw_call_async` + 双栈泵（fw-nodejs 的 Promise 模型天然无此限制）。fw_stack_poll 每轮无条件驱动收发与连接管理（Windows WSAPoll 对非阻塞 connect 完成不报告就绪）。
-4. **事件到达时 IDL 缺失的处理**：发起异步 GetIDL 并丢弃当前事件（记 Error 日志）；fw-nodejs await 拉取后交付。仅影响"订阅预拉取竞态"窗口，正常路径 schema 已就绪。
-5. **订阅预拉取一律后台化**：fw_subscribe 的 IDL 预拉取为异步（失败仅日志）；fw-nodejs 在主线程场景同步等待拉取完成。
-6. **整型按 int64 承载**：v5 类型白名单为 u8~u64/i8~i64；u64 值 > INT64_MAX 时 enum/base 校验拒绝（实际 IDL 未使用该范围）；fw-nodejs 超 Number 安全整数时返回 BigInt。f80 三实现一致不支持（协议允许可选，IDL 加载期拒绝）。
-7. **跨栈互通注意事项**：C 栈的 TCP 出站连接源地址由系统选路（可能为 127.0.0.1），与 UDP 绑定地址（127.0.0.2）不同——tcp-event 按源 IP 匹配连接的场景（本示例 IDL 未使用）需部署时保证两侧地址口径一致（fw-nodejs 同样存在该现象）。
-8. **日志级别为进程级全局**（`fw_log_set_level`）：多栈共用；fw-nodejs 每栈独立 logger。
+1. **组播不可用时的单播 Find 降级窗口**：Expired 记录保留 60×period 期间向最近已知地址周期单播 Find（§2 认可的降级路径，行为与组播发现等价）；fw-nodejs 无此兜底（依赖组播）。
+2. **单进程双栈集成测试的调用模式**：`fw_call`/`fw_fire_forget` 等同步 API 的内部泵只驱动本栈（被叫栈需自身事件循环）——单进程双栈场景须用 `fw_call_async` + 双栈泵（fw-nodejs 的 Promise 模型天然无此限制）。fw_stack_poll 每轮无条件驱动收发与连接管理（Windows WSAPoll 对非阻塞 connect 完成不报告就绪）。
+3. **事件到达时 IDL 缺失的处理**：发起异步 GetIDL 并丢弃当前事件（记 Error 日志）；fw-nodejs await 拉取后交付。仅影响"订阅预拉取竞态"窗口，正常路径 schema 已就绪。
+4. **订阅预拉取一律后台化**：fw_subscribe 的 IDL 预拉取为异步（失败仅日志）；fw-nodejs 在主线程场景同步等待拉取完成。
+5. **整型按 int64 承载**：v5 类型白名单为 u8~u64/i8~i64；u64 值 > INT64_MAX 时 enum/base 校验拒绝（实际 IDL 未使用该范围）；fw-nodejs 超 Number 安全整数时返回 BigInt。f80 三实现一致不支持（协议允许可选，IDL 加载期拒绝）。
+6. **跨栈互通注意事项**：C 栈的 TCP 出站连接源地址由系统选路（可能为 127.0.0.1），与 UDP 绑定地址（127.0.0.2）不同——tcp-event 按源 IP 匹配连接的场景（本示例 IDL 未使用）需部署时保证两侧地址口径一致（fw-nodejs 同样存在该现象）。
+7. **日志级别为进程级全局**（`fw_log_set_level`）：多栈共用；fw-nodejs 每栈独立 logger。
+
+> 组播接口（`IP_ADD_MEMBERSHIP` / `IP_MULTICAST_IF` 取 `bind_address`，`IP_MULTICAST_LOOP=1`）与 fw-nodejs 语义一致，不构成偏差，故未列入本清单。
 
 ## 已知问题与遗留
 

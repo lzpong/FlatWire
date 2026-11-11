@@ -25,6 +25,11 @@ extern "js" fn ffi_transport_init(_x : Int) -> Unit =
 /// 单调毫秒时钟（Date.now；返回 Double 由 MoonBit 侧转 Int64，避免 Int64 跨 FFI 边界）
 extern "js" fn ffi_now_ms(_x : Int) -> Double = "(x) => Date.now()"
 
+/// 本机 IPv4 地址集（逗号分隔；含 127.0.0.1 等 internal 地址）——
+/// §7.2 自身 Offer 跳过：bind_address 为空时的退化判据需要"源地址 ∈ 本机地址集"
+extern "js" fn ffi_local_addrs(_x : Int) -> String =
+  "(_) => { const os = require('node:os'); const out = []; const ifs = os.networkInterfaces(); for (const k of Object.keys(ifs)) { for (const a of (ifs[k] || [])) { if (a.family === 'IPv4') { out.push(a.address); } } } return out.join(','); }"
+
 /// 设置周期定时器（返回 JS 侧托管的句柄 id；回调闭包由 JS 定时器长期持有 → owned）
 #owned(fn_cb)
 extern "js" fn ffi_set_interval(fn_cb : (Int) -> Unit, ms : Int) -> Int =

@@ -350,6 +350,44 @@ test "length 64-bit no truncation on udp" {
   }
 }
 
+/// §3.2：Length 协议上限 2^56−1（PLB=7 全 0xFF）必须按 Int64 完整解析；
+/// 因超过 max_payload_len，UDP 回 RST(0x23)，不得截断后误判合法。
+test "length 2^56-1 upper bound on udp" {
+  // 8B 帧头（PLB=7）+ 7B Length（全 0xFF = 2^56−1），无 Payload
+  let raw = b"\x07\x01\x00\x01\x00\x01\x01\x01\xff\xff\xff\xff\xff\xff\xff"
+  match parse_udp(raw) {
+    Reject(code, _) => assert_eq(code, 0x23)
+    Ok(_) => fail("length 2^56-1 must not be accepted (over max_payload_len)")
+    Drop => fail("length 2^56-1 expect Reject(0x23), got Drop")
+  }
+}
+
+/// §3.2/§4.1：TCP 路径 Length 按 Int64 保存（2^56−1 不截断）；
+/// 声明长度收不满时半帧超时进入丢弃模式，剩余 R 同样按 Int64 计算。
+test "tcp length 2^56-1 int64 and drop remainder" {
+  let top : Int64 = (1L << 56) - 1L
+  let p = TcpFrameParser::new(0, 5000L)
+  // 合法帧头（VER=0）+ PLB=7 全 0xFF：8B 帧头 + 7B Length = 15B
+  let hdr = b"\x07\x01\x00\x01\x00\x01\x01\x01\xff\xff\xff\xff\xff\xff\xff"
+  assert_eq(p.feed(hdr, 1000L).length(), 0) // 未收满，不交付
+  assert_true(p.cur_length == top)          // Int64 原样保存（Int 会溢出/截断）
+  match p.state {
+    StPayload => ()
+    _ => fail("expect StPayload after 15B header")
+  }
+  // 到达 tcp_frame_timeout_ms → 阶段二：RST(0x26) + 丢弃模式（R = L − 已收 = 2^56−1）
+  let evs = p.check_timeout(6000L)
+  assert_eq(evs.length(), 1)
+  match evs[0] {
+    TcpRst26(strm) => assert_eq(strm, 1) // 帧头完整 → 回显当前帧 StrmID
+    _ => fail("expect TcpRst26(1)")
+  }
+  match p.state {
+    StDropping(r) => assert_true(r == top) // 剩余量 64 位，未溢出为负数或 0
+    _ => fail("expect StDropping(2^56-1)")
+  }
+}
+
 /// RST Code 非法（测试 2.20：RST Code ∈ {0x00} ∪ 0x20~0x3F）
 test "rst code validation (2.20)" {
   match parse_udp(encode_frame(spec(false, false, Rst, 0x01, 1, 1, 1, 1), b"", None)) {

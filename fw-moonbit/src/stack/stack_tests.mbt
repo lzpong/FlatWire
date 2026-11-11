@@ -113,6 +113,34 @@ test "offer discover then call delivers response" {
   assert_eq(errs, 0)
 }
 
+/// §5.38 栈级链路：main 对 Find 的单播应答（源 = bind_address:udp_port）落到 client socket，
+/// 必须在 SD 入口整帧剔除——否则 is_available 对自己 true，并进入"TTL 归零 → 降级单播 Find
+/// 自问自答"的自环。此处经 on_transport_event（真实帧分发入口）而非直调 sd.handle_offer，
+/// 仅少了 socket 事件循环（moon test 同步块无法等待异步回调）。
+test "5.38 self unicast offer skipped at stack entry" {
+  let cfg : StackConfig = { ..StackConfig::default("unused_dir"), bind_address: "127.0.0.1" }
+  let s = Stack::new(cfg)
+  let offer : @frame.Frame = {
+    ctr: true,
+    ren: false,
+    ver: 0,
+    msk: false,
+    typ: @frame.Non,
+    code: 0x01,
+    svc_id: 0,
+    if_id: 0,
+    inst_id: 0,
+    strm_id: 0,
+    payload: @sd.encode_offer_entries([{ svc_id: 1, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 4 }]),
+  }
+  // client socket（from_server=false）收到本栈 main 的单播应答 → 剔除
+  s.on_transport_event(@transport.UdpFrame(offer, "127.0.0.1", 5400, false))
+  assert_eq(s.is_available(1, 1), false)
+  // 同端口但不同绑定地址（同机另一独立进程）→ 远端，正常入库
+  s.on_transport_event(@transport.UdpFrame(offer, "127.0.0.2", 5400, false))
+  assert_eq(s.is_available(1, 1), true)
+}
+
 /// 栈级编解码链路：call → input 编码 → 服务端 handler（input 解码/output 编码）→
 /// Response → output 解码交付（§13 payload 语义全链路；CStruct ↔ VArray，§9.3）
 test "call with struct codec roundtrip" {

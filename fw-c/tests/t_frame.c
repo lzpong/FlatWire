@@ -78,8 +78,15 @@ int suite_frame(void) {
     // payload_len / expected_total 原样保留；截断会使帧边界错位（回归防护）。
     fw_parse_opts_t o;
     opts(&o, 0); // TCP 语义：UDP 会先被 max_payload_len 拒绝
-    const uint64_t cases[2] = { (uint64_t)1 << 40, (((uint64_t)1 << 56) - 1) };
-    for (int k = 0; k < 2; k++) {
+    // 含 2^32−1 / 2^32：交付上限附近取值必须原样保留（头部层等价覆盖 4GB 交付路径，
+    // 不实际构造该路径）；2^56−1 为协议上限顶点
+    const uint64_t cases[4] = {
+      (uint64_t)1 << 40,
+      0xFFFFFFFFULL,
+      0x100000000ULL,
+      (((uint64_t)1 << 56) - 1)
+    };
+    for (int k = 0; k < 4; k++) {
       uint8_t hb[15];
       memset(hb, 0, sizeof(hb));
       hb[0] = 0x07; // CTR=0 REN=0 VER=0 MSK=0 PLB=7

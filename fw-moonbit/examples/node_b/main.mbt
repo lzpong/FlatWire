@@ -107,7 +107,7 @@ fn main {
   // ---- 协议栈启动：纯客户端角色（tcp_enabled=false 不监听；GetIDL/rpc 走出站连接）----
   let cfg : @stack.StackConfig = {
     udp_port: port,
-    tcp_port: 5400, // §2 TCP/UDP 共用端口 5400（规范 §2）
+    tcp_port: port, // §2 TCP/UDP 共用端口（与 udp_port 一致）
     bind_address: bind,
     tcp_enabled: false,
     idl_dir,

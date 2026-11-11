@@ -12,9 +12,9 @@ optional；类型白名单 u8~u64 / i8~i64 / f32 / f64 / bool / timestamp / enum
 # 工具链要求：moon（moonc v0.10.15+），JS 后端
 $env:Path = "C:\Users\Ong\.moon\bin;$env:Path"   # moon 不在默认 PATH 时
 
-cd implementations\fw-moonbit
+cd fw-moonbit
 
-# 运行全部单元测试（132 用例；必须显式指定 js 目标——extern "js" 不支持默认 wasm 后端）
+# 运行全部单元测试（138 用例；必须显式指定 js 目标——extern "js" 不支持默认 wasm 后端）
 moon test --target js
 
 # 发送背压实测（§12.6；真实 socket 拥塞：本进程起黑洞服务端 pause 不读 + 持续写大帧）
@@ -45,6 +45,10 @@ node "_build\js\debug\build\examples\node_b\node_b.js" --run-for 55000
 NodeA=127.0.0.1 / NodeB=127.0.0.2，同机演示按回环 IP 区分单播投递）、
 `FW_IDL_DIR`（IDL 库目录）。
 
+**TCP 端口**：示例的 `tcp_port` 直接取 `FW_PORT`（§2 TCP/UDP 共用端口）。此前硬编码 5400，非默认端口下 TCP 监听会与发现的 UDP 端口不一致，客户端 GetIDL/rpc 报 `ECONNREFUSED`；已修复，新增示例请勿再写死端口。
+
+**跨栈互通**：仓库根目录 `node scripts/interop.mjs`（前置 `moon build --target js`，脚本以 `_build/js/debug/build/examples/node_a/node_a.js` 与 `node_b/node_b.js` 参与六组两两组合）。
+
 ## 模块结构
 
 ```
@@ -54,7 +58,7 @@ src/
              CRC-16/CCITT-FALSE（§9.6，接口 "crc": true 开启）、掩码（§10）
   frame/     帧层（§3/§4）：帧头（§3）、UDP 十步解析（§4.3）、
              TCP 半帧两阶段超时（§4.1 帧头不完整关连接 / Payload 不完整精确丢弃）
-  errors/    错误码表（§11）：两层两码——帧级 0x23 / IDL 契约级 0x20（§8.1）
+  errors/    错误码表（§12）：两层两码——帧级 0x23 / IDL 契约级 0x20（§12.1）
   strm/      StrmID 管理（§6）：控制帧池（订阅会话+GetIDL 查询，含释放冷却）/
              数据帧池（rpc/events 共享实例，client/server 子池独立）
   transport/ 传输层（§5.2/§5.6/§5.7）：UDP 双 socket（server=组播+5400 单播收 /
@@ -97,18 +101,22 @@ MoonBit 与 Node.js 的边界位于各模块 `*_ffi.mbt`，通过 `extern "js"` 
 |---|---|
 | §2 端口/地址语义 | `transport`（双 socket）+ `stack`（应答帧恒走 server socket） |
 | §3 帧头 / §4.3 UDP 解析 | `frame/frame.mbt` `frame/parse.mbt` |
+| §3.2 Length 64 位 | `frame/parse.mbt`：PLB=0~7、最长 7B 大端（协议上限 2^56−1），Length 声明与丢弃剩余量按 `Int64` 计算（避免 Int 溢出/截断）；UDP 先经 Int64 与 `max_payload_len` 比较再转 Int 交付，TCP 按声明长度缓冲（无显式单帧上限，受 JS 数组/内存约束） |
+| §3.5 IfID 类型分区（SHOULD） | 仅要求 IfID ∈ 0x0001~0xFFFF；`0x0001~0x7FFF` rpc/ff、`0x8000~0xFFFF` event 仅为建议，**不因区间不符拒绝帧或 IDL** |
 | §4.1 TCP 半帧两阶段 | `frame/tcp.mbt`（解析器）+ `transport`（tick 超时驱动） |
+| §4.3 RST 豁免 | 解析任何 TYP=RST 帧跳过步骤 3/4 的 ID 校验（**不区分 CTR**）；数据帧 ACK 不豁免，违规回 RST(0x00) |
 | §5.1/§5.2 call / fire_forget | `rpc/rpc_client.mbt` `rpc/rpc_server.mbt` |
 | §5.5 CON 重传链 | `rpc/rpc.mbt`（interval × 2^retries） |
 | §5.6 TCP 长连接复用 | `transport`（outbound 幂等键）+ `rpc`（连接等待队列） |
-| §5.7 心跳 / 存活 | `transport`（tick 500ms 粒度检查） |
-| §6 StrmID 管理 | `strm/strm.mbt` |
+| §5.7 心跳 / 存活 | `transport`（tick 500ms 粒度检查；失效阈值固定 2×`heartbeat_period_ms`，**无**独立 `heartbeat_timeout_ms` 覆盖项） |
+| §6 StrmID 管理 | `strm/strm.mbt`（释放冷却、回绕；**未实现**池空闲回收 `strm_pool_idle_ms`） |
 | §7 SD 四操作 / §7.6 状态机 | `sd/sd.mbt` `sd/entry.mbt` `sd/peer.mbt` |
 | §7.2 GetIDL 双角色 | `sd/getidl.mbt`（客户端拉取）+ `sd/sd.mbt`（服务端应答） |
 | §8.1/§8.2 订阅/事件 | `sd/sub_client.mbt` `sd/sub_server.mbt` `events/events.mbt` |
 | §9 编码层 | `codec/` |
 | §11 IDL 库 | `idlstore/` |
 | §13.2 应用 API | `stack/stack_api.mbt` |
+| §12.6 发送背压（实现限制） | `transport/transport_ffi.mbt`（`__fw.q`：有界数据帧队列 / 控制帧直写 / O(1) 全栈预算增量计数 / 对账） |
 
 ## 有意偏差（实现层决策，非协议变更）
 
@@ -134,6 +142,13 @@ MoonBit 与 Node.js 的边界位于各模块 `*_ffi.mbt`，通过 `extern "js"` 
    `__fw.q.check` 开启后每次记账变更与遍历求和对账（漂移抛错，见 `examples/bp_probe`）。
    水位来源仍以 `socket.writableLength` 计算（含控制帧直写字节，与 C 的独立队列计数不同；
    差异与统一判断见设计 §12.6）。
+
+## 已知限制（与 C/Node 的实现差距，非协议差异）
+
+1. **无 TCP 连接数上限**：`Transport` 仅用 `conns` Map 记录连接，不设 `max_conns`/`max_tcp_connections` 上限，也不拒绝超量连接（C/Node 均为 1024，超限拒绝）。容量由操作系统句柄与内存约束。
+2. **无 Strm 池空闲回收**：`strm` 只有释放冷却与回绕，不实现 `strm_pool_idle_ms` 的空闲收缩（C/Node 已实现）。池容量因此只增不减，长期运行不会因空闲而收缩。
+3. **心跳失效阈值不可覆盖**：固定 `2×heartbeat_period_ms`（C 同；Node 支持 `heartbeat_timeout_ms` 覆盖）。
+4. **仅 IPv4**：UDP socket 固定 `udp4`，不支持 IPv6 组播（ff02::1:BB）（C/Node 同）。
 
 ## 依赖
 

@@ -1,4 +1,4 @@
-﻿﻿// transport 包测试：仅覆盖纯函数（RST 构造 / Ping 帧）。
+﻿﻿﻿﻿// transport 包测试：仅覆盖纯函数（RST 构造 / Ping 帧）。
 // 真 socket 收发 / 心跳 / 重连等异步行为在集成冒烟脚本验证——
 // moon test 为同步执行块，无法等待 node 事件循环回调，busy-wait 会阻塞事件循环。
 
@@ -140,4 +140,35 @@ test "send_tcp_frame reports not written for unknown conn" {
   )
   // 控制帧（Ping）同样不得伪造成功
   assert_eq(t.send_tcp_frame(999, @frame.ctrl_spec(@frame.Non, 0x00, 0), b""), false)
+}
+
+/// §5.38 自身来源判据（SD 入口自身 Offer 判定与 C/Node 同一口径）：
+/// 指定 bind 时只认 (bind_address, udp_port)；bind 为空时退化为
+/// "源端口 == udp_port 且源地址 ∈ 本机地址集"。
+/// 该判据拦的是 main 对 Find 的单播应答（源端口 = udp_port、落到 client 临时端口），
+/// 组播自回环那条由 C/Node 的传输层过滤兜底，MoonBit 传输层无此过滤、同样在此拦截。
+test "is_self_source: exact bind first, wildcard falls back to local addrs" {
+  let base : TransportConfig = {
+    udp_port: 5400,
+    tcp_port: 5400,
+    bind_address: "",
+    tcp_enabled: true,
+    local_ver: 0,
+    max_payload_len: 1400,
+    tcp_frame_timeout_ms: 5000L,
+    heartbeat_period_ms: 30000L,
+    max_send_queue_bytes: 262144,
+    send_queue_budget_bytes: 67108864,
+  }
+  // 精确 bind：仅 (bind, udp_port) 命中；同端口其它地址（同机另一独立进程）按远端处理
+  let t1 = Transport::new({ ..base, bind_address: "127.0.0.2" }, fn(_e) { () })
+  assert_eq(t1.is_self_source("127.0.0.2", 5400), true)
+  assert_eq(t1.is_self_source("127.0.0.1", 5400), false)
+  assert_eq(t1.is_self_source("127.0.0.2", 5401), false)
+  // 通配 bind：懒加载地址集前先注入固定值，避免依赖运行环境网卡枚举
+  let t2 = Transport::new(base, fn(_e) { () })
+  t2.local_addrs.push("10.1.2.3")
+  assert_eq(t2.is_self_source("10.1.2.3", 5400), true)
+  assert_eq(t2.is_self_source("10.9.9.9", 5400), false)
+  assert_eq(t2.is_self_source("10.1.2.3", 5401), false)
 }

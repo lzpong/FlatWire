@@ -8,7 +8,7 @@
   },
   "main": "src/stack.js",
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "example:node-a": "node examples/node-a.js",
     "example:node-b": "node examples/node-b.js"
   },

@@ -629,21 +629,22 @@ test('§4.4 UDP 组播启发式不误判数据帧与 REN', () => {
   assert.equal(isMulticastLike(f({ typ: TYP.CON, code: 0x02 })), false); // 数据 FF
 });
 
+// 手工构造数据帧头（PLB=7）：8B 帧头 + 7B Length（len 用 BigInt 以构造超 2^53 的值）
+// byte0 可覆盖，用于构造违规帧（如 VER=1）
+const hdr7 = (len, byte0 = 0x07) => {
+  const b = Buffer.alloc(15);
+  b[0] = byte0; // 默认 CTR=0 REN=0 VER=0 MSK=0 PLB=7
+  b[1] = (TYP.NON << 6) | CODE.REQUEST;
+  b[2] = 0x10; b[3] = 0x00; // SvcID=0x1000
+  b[4] = 0x00; b[5] = 0x01; // IfID=1
+  b[6] = 0x01; b[7] = 0x01; // InstID=1 StrmID=1
+  let v = BigInt(len);
+  for (let i = 6; i >= 0; i--) { b[8 + i] = Number(v & 0xffn); v >>= 8n; }
+  return b;
+};
+
 // ---- §3.2 Length 64 位语义：PLB=7 声明长度不得被 32 位截断 ----
 test('§3.2 Length 64 位语义（PLB=7）', () => {
-  // 手工构造数据帧头（PLB=7）：8B 帧头 + 7B Length
-  const hdr7 = (len) => {
-    const b = Buffer.alloc(15);
-    b[0] = 0x07; // CTR=0 REN=0 VER=0 MSK=0 PLB=7
-    b[1] = (TYP.NON << 6) | CODE.REQUEST;
-    b[2] = 0x10; b[3] = 0x00; // SvcID=0x1000
-    b[4] = 0x00; b[5] = 0x01; // IfID=1
-    b[6] = 0x01; b[7] = 0x01; // InstID=1 StrmID=1
-    let v = BigInt(len);
-    for (let i = 6; i >= 0; i--) { b[8 + i] = Number(v & 0xffn); v >>= 8n; }
-    return b;
-  };
-
   // 2^40（远超 32 位，但在 Number 精确整数范围内）→ 原样保留
   const h1 = parseHeader(hdr7(2n ** 40n), 0, { ver: 0, isUdp: false });
   assert.equal(h1.state, 'ok');
@@ -658,4 +659,53 @@ test('§3.2 Length 64 位语义（PLB=7）', () => {
   const h3 = parseHeader(hdr7(2n ** 56n - 1n), 0, { ver: 0, isUdp: true, maxPayloadLen: 1400 });
   assert.equal(h3.state, 'invalid');
   assert.equal(h3.rst.code, RST_CODE.PAYLOAD_TOO_LARGE); // UDP 帧级超限 0x23
+});
+
+// ---- §3.2 Length 实现承载分界：2^53−1 恰好通过、2^53 起拒绝（Node 特有边界） ----
+test('§3.2 Length 实现承载分界：2^53−1 通过、2^53 拒绝', () => {
+  const maxSafe = 2n ** 53n - 1n;
+  // 恰好等于 MAX_SAFE_INTEGER：判定是 > 上限 → 仍合法，且不得截断
+  const h1 = parseHeader(hdr7(maxSafe), 0, { ver: 0, isUdp: false });
+  assert.equal(h1.state, 'ok');
+  assert.equal(h1.payloadLen, Number(maxSafe));
+  assert.equal(h1.expectedTotal, 15 + Number(maxSafe));
+
+  // 2^53：超出 JS 精确整数范围 → TCP 按协议违规 0x00 拒绝
+  const h2 = parseHeader(hdr7(maxSafe + 1n), 0, { ver: 0, isUdp: false });
+  assert.equal(h2.state, 'invalid');
+  assert.equal(h2.rst.code, RST_CODE.PROTOCOL_VIOLATION);
+
+  // 同一帧头在 UDP 路径按帧级超限 0x23 拒绝（两层两码）
+  const h3 = parseHeader(hdr7(maxSafe + 1n), 0, { ver: 0, isUdp: true, maxPayloadLen: 1400 });
+  assert.equal(h3.state, 'invalid');
+  assert.equal(h3.rst.code, RST_CODE.PAYLOAD_TOO_LARGE);
+});
+
+// ---- §3.2/§4.1 TCP 违规帧定界：头长 + plen 超出安全整数 → 放弃同步（不截断） ----
+test('§3.2 TCP 违规帧定界：头长+plen 达 2^53 → abandoned', () => {
+  // 违规帧（VER=1，帧头校验失败），PLB=7 → 帧头 15B
+  const bad = (plen) => hdr7(plen, 0x17); // CTR=0 REN=0 VER=1 MSK=0 PLB=7
+
+  // total = 15 + (2^53−15) = 2^53 → 超出安全整数：无法精确定界，置同步丢失
+  const p1 = new TcpStreamParser({ ver: 0 });
+  let rst1 = 0;
+  p1.opts.onRst = () => { rst1++; };
+  p1.feed(bad(2n ** 53n - 15n));
+  assert.equal(rst1, 1);          // 违规帧只回一次 RST
+  assert.equal(p1.abandoned, true);
+  assert.equal(p1.isReceiving(), true); // 仍算占用：等连接层半帧超时关闭
+
+  // total = 2^53−1 → 恰好安全：进入丢弃模式，剩余 R 精确
+  const p2 = new TcpStreamParser({ ver: 0 });
+  p2.opts.onRst = () => {};
+  p2.feed(bad(2n ** 53n - 16n));
+  assert.equal(p2.abandoned, false);
+  assert.equal(p2.dropMode, true);
+  assert.equal(p2.dropRemaining, 2 ** 53 - 1 - 15);
+  // 后续字节按剩余量递减，不误交付、不产帧
+  const got = [];
+  p2.opts.onFrame = (fr) => got.push(fr);
+  p2.feed(Buffer.alloc(10, 0xEE));
+  assert.equal(p2.dropRemaining, 2 ** 53 - 1 - 25);
+  assert.equal(got.length, 0);
 });

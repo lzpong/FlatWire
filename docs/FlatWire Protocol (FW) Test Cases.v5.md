@@ -15,6 +15,10 @@
 | v5.0-r6 | **MoonBit 对齐发送背压**（`fw-moonbit`，第三批）：新增 **BP-1(MB)**（真实 socket 拥塞——黑洞服务端 `pause()` + 持续写 1400B Payload：接受 2090 帧后 `send_tcp_frame` 返回 `false`，`writableLength` 保持 260850B 不变（未写入任何字节），再写仍 `false` 且水位不增长；同时 Ping 控制帧仍直写成功）、**BP-2(MB)**（持续满 ≥ 2×`heartbeat_period_ms`（500ms 周期 → 1000ms 窗口）→ tick 断连，`__fw.q.closedFull` 增长）、**BP-3(MB)**（rpc 客户端写失败回滚：`call` 清理响应超时 + `pending` + StrmID，`fire_forget` 释放 StrmID；`tcp_send_or_wait` 返回 Bool 并以 `on_fail` 通知调用方）。MoonBit 语义扩展（签名不变）：`send_tcp_frame` 返回值由「编码成功」改为「写入/入队成功」；`ffi_tcp_write` 由 `Unit` 改为 `Bool`。口径差异见设计 §12.6（Node 水位含控制帧字节，本轮不改 Node） |
 | v5.0-r7 | **三栈全栈预算判定改为 O(1) 增量计数 + 记账对账**（实现限制，非协议语义）：不再每次写入遍历所有连接求和，改为全栈累计（数据帧入队加 / drain 归还 / 连接关闭扣减残留），上限值、拒写返回、控制帧直写语义不变。新增 **BP-4(C)**（两条真实连接 + 等价积压：第二条自身 2048B 远低于单连接上限 8192B，帧长 2058B 时全栈 6154+2058=8212>8192 → `FW_ERR_WOULDBLOCK`；每步 `fw_int_sendq_consistent` 一致，预算满时控制帧仍直写）、**BP-4(Node)**（真实 socket 拥塞：budget 393216 = 1.5×单连接上限，c1 满 260850B 后 c2 在自身约 131KB 时被 `stack budget` 拒写；控制帧直写后增量计数与遍历求和对账一致；关闭后同为 0）、**BP-4(MB)**（`examples/bp_probe` 双黑洞：c2 自身 131130B 时撞预算，`used+ctrl=391996B` 与遍历求和一致，持续满断连 `closedFull=2`，关闭后 `used=ctrl=traversal=0`）。水位口径差异保留未统一（判断与代价见设计 §12.6） |
 
+| v5.0-r8 | **收尾补测与互通自动化**：新增 **1.4b**（Node JS 安全整数承载分界 2^53−1 / 2^53）、**1.4c**（C 头部层 `0xFFFFFFFF` / `0x100000000` / 2^56−1 原样返回）、**1.4d**（MoonBit 2^56−1 的 UDP 拒绝与 TCP `cur_length`/drop 剩余 Int64）、**2.22b**（Node TCP 违规帧定界 `total` 达 2^53 → `abandoned`，2^53−1 → dropMode）、**5.38**（自身 Offer 必须跳过，对应设计 §7.2 新增 MUST）；新增 **§10 跨栈互通自动化**（六组两两组合、判定口径与前置构建）。三栈用例总数更新为 C 98 / Node 102 / MoonBit 134 |
+| v5.0-r9 | **Node/MoonBit 补齐 §5.38 用例**：Node 补"自身端口回环在传输层被丢弃 / 另一 socket 回环放行 / 远端同端口放行"1 项；MoonBit 补"wildcard bind 退化判据"与"精确 bind 判据（同端口不同地址仍按远端）"2 项，并在 `Sd::handle_offer` 入口新增 `is_self_source` 判定。**r10 纠正**：本轮"Node 的 client socket 收不到自身组播回环、无需 SD 层判"的结论有误——只观测了传输层且未注册实例（main 无本地实例可应答），漏掉了 Find 单播应答这条真实路径。三栈用例总数更新为 C 98 / Node 103 / MoonBit 136 |
+| v5.0-r10 | **§5.38 补齐单播应答路径（Node 修复 + 三栈真实栈用例）**：Node `Discovery.onOffer` 入口新增 `_isSelfOffer`（判据同 C/MoonBit），拦截 main 对 client Find 的单播应答；传输层原过滤保留不动（两层各管一条路径）。新增真实栈用例：**5.38(Node)** 单栈 `start+register` 验证 client 确实收到自身单播 Offer、发现缓存为空、`is_available` 对自己 false、连续 Find 无周期自环，并补双栈"远端不误伤"1 项；**5.38(C)** 单栈 `start+register` 跑 2.5s（覆盖启动 Find 单播应答、周期 Offer、TTL tick 与 2 次降级窗口）断言 `ndisc=0` / 对自己不可用 / 无待决 Find；**5.38(MB)** 新增 `is_self_source` 判据 3 分支单测 + `on_transport_event` 栈级入口（client socket 收自身单播应答被剔除、同端口异地址远端保留）1 项（MoonBit 无 poll API，同步测试块无法等待 socket 事件循环，栈级用例止于帧分发入口）。三栈均做过"临时禁用 SD 判定 → 用例必须失败"的反向验证。用例总数更新为 C 99 / Node 105 / MoonBit 138 |
+
 **判定**：全部用例通过 = 实现满足 FW v5.0 一致性要求。
 
 ---
@@ -27,6 +31,9 @@
 | 1.2 | VER 不等拒绝 | VER ≠ 本端 | 组播静默丢弃；单播回 RST(0x22) |
 | 1.3 | PLB 边界 | PLB=0 / PLB=1 阈值（0/1/255/256）/ PLB=2（65535/65536）/ PLB=7 | PLB=0 无 Length 字段；各阈值 +1 必须进位（255→1B、256→2B、65535→2B、65536→3B）；PLB=7 支持最大 Length（64 位语义，解析端不得截断为 32 位） |
 | 1.4 | Payload Length 编码 | 0 / 1 / 255 / 65535 / 2^56-1 | 0→PLB=0；超大值→PLB=7；解析回读 `payload_len`/`expected_total` 必须与声明值一致 |
+| 1.4b | **实现承载分界（JS 安全整数，Node）** | 手工拼 15B 数据帧头（PLB=7），Length 取 2^53−1 / 2^53 | 2^53−1 → 解析 `ok`，`payloadLen`=2^53−1、`expectedTotal`=15+2^53−1；2^53 → `invalid`：TCP 回 RST(0x00)、UDP 回 RST(0x23) |
+| 1.4c | **uint32 交付上限头部原样（C）** | `fw_parse_header` 喂入手工 15B 帧头，Length = `0xFFFFFFFF` / `0x100000000` / 2^56−1 | 返回的 `payload_len` 与声明值**逐位一致**（解析层按 uint64 表示，不截断）；`0xFFFFFFFF` 等价覆盖交付结构 uint32 上限，2^32 及以上只做头部层校验，**不构造 4GB 实际交付路径** |
+| 1.4d | **Int64 顶点与丢弃计数（MoonBit）** | 手工 15B 帧头，Length = 2^56−1（PLB=7 全 `0xFF`）：①UDP 解析；②TCP 解析器 `feed` 后触发半帧超时 | ①UDP → Reject(0x23)（超 `max_payload_len`，不得因截断而误判合法）；②TCP → `cur_length` == 2^56−1（Int64 完整保存），超时后回 `TcpRst26` 且 `StDropping` 剩余 R == 2^56−1 |
 | 1.5 | **IDL 变长字段强制声明** | string/bytes/array 既无 `fixed_len` 也无 `max_len` | **IDL 加载失败**（该定义被拒绝，其他定义不受影响） |
 | 1.6 | Bool 严格解码 | `0x00` / `0x01` / `0x02` | `0x00`→false、`0x01`→true；`0x02` 抛 `InvalidBoolEncoding` |
 | 1.7 | Signed 边界（裸字节） | i8 -128/0/127；i64 值 10 | 1B/8B 大端补码正确；**值 10 仍占满 8B**（恒定宽度，不压缩） |
@@ -92,6 +99,7 @@
 | 2.20 | **RST Code 非法** | TYP=RST 且 Code=0x01（非错误码） | 回 RST(0x00) 并丢弃（RST Code ∈ {0x00} ∪ 0x20~0x3F） |
 | 2.21 | **TCP 收 CON/ACK** | TCP 连接上收到 TYP=CON 或 ACK 帧 | 回 RST(0x00) 并丢弃（TCP 不使用 CON/ACK） |
 | 2.22 | **TCP 半帧超时——帧头完整** | 写入完整帧头（≥8B，帧总长 L 已知，含 Length/Masking Key）后停止发送 | `tcp_frame_timeout_ms` 后回 RST(0x26)，进入**丢弃模式**：按帧头声明精确丢弃剩余 R = L − 已收字节，**不关闭连接** |
+| 2.22b | **违规帧定界的实现溢出边界（Node）** | 违规帧头（VER=1，PLB=7 → 头长 15B）：①Length = 2^53−15；②Length = 2^53−16 | ①`total = 头长 + plen = 2^53` 非安全整数 → 回 RST(0x26) 一次并置 `abandoned`（帧定界同步丢失，等待连接层半帧超时关闭）；②`total = 2^53−1` 可表示 → 进入 dropMode，`dropRemaining = total − 已收`，继续喂字节只递减不交付 |
 | 2.23 | **丢弃模式——收满恢复** | 进入丢弃模式后继续发完剩余 R 字节，随后发送正常新帧 | 收满 R 字节即恢复正常接收（`IDLE`），新帧正确解析交付，**连接继续复用不重建** |
 | 2.24 | **丢弃模式——字节刷新计时** | 丢弃模式中慢速发送剩余字节：相邻字节间隔 < 兜底超时，总时长超过兜底超时 | 每收到任意字节刷新兜底计时，不触发超时断连，收满 R 后恢复正常 |
 | 2.25 | **丢弃模式——对端 EOF** | 进入丢弃模式后发送端关闭连接（EOF/RST） | 随连接关闭一并处理，无悬挂丢弃状态（进程死亡时 OS 必然关闭连接，接收端立即感知，不依赖超时） |
@@ -193,6 +201,9 @@
 | 5.35 | **实例注销但定义在库** | 服务端 S 的最后实例 unregister 后（IDL 定义文件仍在库中且已加载），收到 GetIDL(S, MajorVer) | 正常回 0x11（IDL 为服务级事实，与实例在线无关，见 §7.2）——集群 IDL 同步在服务瞬时下线窗口内仍可完成 |
 | 5.36 | **启动 Find 预热** | 协议栈启动（单实例部署约束，见规范 §2） | 立即发送一次 Find（空 Payload，查询所有服务）加速发现缓存预热；后续 register/call 的 IDL 按需拉取在启动早期即可命中在线实例 |
 | 5.37 | **组播静默范围对齐** | 组播帧头违规：仅 VER 不符 / UDP 收到控制帧 GetIDL（0x04/0x11）/ 控制帧 StrmID 语义违规三类 | **静默丢弃**（不回 RST）；其余任何违规（含 REN/TYP/PLB/ID 组合非法）**回 RST 对应码**——三栈一致（回归用例：MoonBit 曾对组播候选帧所有 Reject 无差别静默，已收窄为同类集合） |
+| 5.38 | **自身 Offer 必须跳过** | 服务端节点周期性广播 Offer（同机同端口、绑定地址 A）；同进程两 socket：main bind `port`，client bind 临时端口。自身来源有两条可能路径：① 周期 Offer 的组播回环副本（按目的地址+目的端口只投给 bind `port` 的 main）；② main 对 client Find 的**单播应答**（源端口 = `port`，目的端口 = client 临时端口，只到 client） | 发现缓存**不得**出现自身条目：`is_available(svc_id, inst_id)` 不因自身 Offer 变 true，日志无周期 `instance expired`（自环/TTL 反复过期噪声）。两层各拦一条：传输层按"源端口 == 本 socket 端口"丢弃路径①（main 收包）；SD 入口按 `(源地址, 源端口) == (bind_address, port)` 整帧跳过路径②（`bind_address` 为空时退化为源端口 == `port` 且源地址 ∈ 本机地址集）。同进程双 socket 共享发现缓存仍保留：client socket 发出的 Find/Request、以及另一本地绑定地址节点的 Offer 按正常远端语义处理（冲突检测不变） |
+
+**5.38 实现位置**：分两层，互不替代。**SD 层（拦路径②：Find 单播应答）**——C 在 `fw_disc_on_offer` 入口、MoonBit 在 `Sd::handle_offer` 入口、Node 在 `Discovery.onOffer` 入口，均按 `(源地址, 源端口) == (bind_address, port)` 整帧跳过（`bind_address` 为空时退化为源端口 == `port` 且源地址 ∈ 本机地址集）。**传输层（拦路径①：main 的组播自回环）**——C `udp.c`、Node `udp.js _onMessage` 按"源端口 == 本 socket 端口"丢弃；MoonBit 传输层无此过滤，其路径①同样由 SD 入口判据覆盖。只保留传输层会漏掉单播应答（Node 旧实现即因此把自身录进缓存，`is_available` 对自己 true 并在 TTL 归零后反复自问自答）；只保留 SD 层则 main 会白处理自己的组播回环。三者均不改共同的组播过滤策略（VER/ID/控制帧静默口径见 5.37），双 socket 共享发现缓存的设计保持不变。
 
 ---
 
@@ -276,3 +287,19 @@
 | 9.6 | 跨实现互操作 | 不同语言实现使用相同 IDL | 帧级二进制一致（含 bool 规范编码、恒定宽度、CRC-16/CCITT-FALSE） |
 | 9.7 | **新增 IDL 类型不兼容** | MinorVer 不变，字段使用新类型名（非既有白名单） | 违反兼容规则：**新增类型 = Major 不兼容变更**（旧解码器无对应宽度，无法定界跳过） |
 | 9.8 | **enum 未知值 Minor 兼容** | MinorVer+1，enum 新增取值 | 旧客户端按 base 整型透传未知值，不报错，既有字段正常解析 |
+
+---
+
+## 10. 跨栈互通自动化（测试手段）
+
+用于验证 §8 端到端场景在**不同语言实现之间**仍成立（单栈内测试无法覆盖该维度）。
+
+- **编排**：`node scripts/interop.mjs`（仓库根目录；Node 18+，无第三方依赖）。
+- **前置构建**：`fw-c` 需先构建出 `fw_node_a` / `fw_node_b`（`cmake --build build --config Release --target fw_node_a fw_node_b`）；`fw-moonbit` 需 `moon build --target js`；`fw-nodejs` 免构建（脚本直接运行 `examples/*.js`）。脚本启动前会做产物预检并给出缺失项的构建命令。
+- **六组组合**：三栈分别作为 A（服务端）与 B（客户端）两两组合 —— `C→Node`、`C→MoonBit`、`Node→C`、`Node→MoonBit`、`MoonBit→C`、`MoonBit→Node`。
+- **部署约定**：每组独立端口（`FW_PORT` 从 5450 起，组间 +2），A 绑 `127.0.0.1`、B 绑 `127.0.0.2`（同机同端口不能绑同一回环地址）；B 的 `FW_IDL_DIR` 指向每组独立的空目录，以强制走 GetIDL 自动拉取。
+- **判定口径**（三条同时满足才算通过）：
+  1. B 进程退出码为 0；
+  2. B 输出包含 `[VERIFY-1]`~`[VERIFY-5]` 全部标记（发现 / GetIDL 落盘 / rpc / fire_forget / 订阅确认与推送）；
+  3. A 由 `--run-for` **自然退出**，而非被脚本强杀（用于确认优雅退出路径 REN×3 正常，避免残留脏进程）。
+- **超时与清理**：等待 A 输出 `stack started`（25s）后才启动 B；B 超时 45s；任一环节超时则整棵子进程树强制清理并判该组失败。日志写入 `tmp/interop/<组>/`（已忽略提交）。

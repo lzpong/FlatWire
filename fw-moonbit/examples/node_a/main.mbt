@@ -121,7 +121,7 @@ fn main {
   // ---- 协议栈启动（§13.1；StackConfig 全字段手工构造——bind/tcp_enabled 属部署事实）----
   let cfg : @stack.StackConfig = {
     udp_port: port,
-    tcp_port: 5400, // §2 TCP/UDP 共用端口 5400（规范 §2）
+    tcp_port: port, // §2 TCP/UDP 共用端口（与 udp_port 一致；此前硬编码 5400 导致非默认端口起不来 TCP 监听）
     bind_address: bind, // 组播出口接口与绑定地址一致（回环演示场景）
     tcp_enabled: true, // 服务端监听 TCP（rpc/GetIDL/tcp-event 入站）
     idl_dir,

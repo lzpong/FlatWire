@@ -70,6 +70,7 @@ pub struct Transport {
   priv mut tcp_ev_cb : (Int, Int, String, Int, Bytes) -> Unit // TCP 事件回调
   priv mut tcp_next_id_cb : (Int) -> Int // TCP accept conn_id 分配回调
   priv mut tick_cb : (Int) -> Unit // tick 定时回调
+  priv local_addrs : Array[String] // 本机 IPv4 地址集（bind 为空时判定自身来源；懒加载）
 }
 
 /// 单调毫秒时钟（Int64）
@@ -148,7 +149,32 @@ pub fn Transport::new(
     tcp_ev_cb: dummy_tcp,
     tcp_next_id_cb: dummy_next,
     tick_cb: dummy_tick,
+    local_addrs: [],
   }
+}
+
+/// 判定帧来源是否为本栈自身（§7.2 自身 Offer 必须跳过）
+///
+/// 判据：(源地址, 源端口) == (bind_address, udp_port)。
+/// bind_address 为空（全接口）时退化为"源端口 == udp_port 且源地址 ∈ 本机地址集"；
+/// 地址集经 JS 目标 `node:os` 懒加载一次（构造期不触发 FFI，保持 Transport::new 纯构造）。
+pub fn Transport::is_self_source(self : Transport, host : String, port : Int) -> Bool {
+  if port != self.cfg.udp_port {
+    return false
+  }
+  if self.cfg.bind_address != "" {
+    return host == self.cfg.bind_address
+  }
+  if self.local_addrs.is_empty() {
+    let raw = ffi_local_addrs(0)
+    for tok in raw.split(",") {
+      let s = tok.to_owned()
+      if s != "" {
+        self.local_addrs.push(s)
+      }
+    }
+  }
+  self.local_addrs.contains(host)
 }
 
 /// 启动传输层（幂等）：初始化 FFI → 双 UDP socket → TCP listen → 500ms tick

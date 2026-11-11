@@ -15,6 +15,7 @@ import {
   encodeSubscribeEntries, decodeSubscribeEntries, encodeGetIdlEntry, decodeGetIdlEntry,
 } from './entries.js';
 import { RetransmitTable } from '../rpc/retransmit.js';
+import { localIpv4Set } from '../transport/udp.js';
 import { RST_CODE, RST_NAME, ServiceNotFound, GetIdlError } from '../errors.js';
 
 const CLIENT_STATE = Object.freeze({
@@ -380,8 +381,31 @@ export class Discovery extends EventEmitter {
   // 客户端角色：发现缓存与状态机（§7.4）
   // ============================================================
 
+  /**
+   * §7.2 自身 Offer 判定：本栈自己发出的 Offer（周期组播或 Find 单播应答）。
+   * 判据与 C/MoonBit 一致：
+   *   - 指定 bind_address：(源地址, 源端口) == (bind_address, port)
+   *   - bind_address 为空：源端口 == port 且源地址 ∈ 本机地址集
+   * 只用于本栈自身通告的剔除，不改变"双 socket 共享发现缓存"（远端帧照常入库）。
+   */
+  _isSelfOffer(meta) {
+    if (meta.port !== this.cfg.port) return false;
+    if (this.cfg.bind_address) return meta.address === this.cfg.bind_address;
+    if (!this._selfAddrSet) this._selfAddrSet = localIpv4Set();
+    return this._selfAddrSet.has(meta.address);
+  }
+
   /** 处理 Offer（周期组播与 Find 单播响应同格式同处理，§7.2） */
   onOffer(frame, meta) {
+    // §7.2 自身 Offer 必须跳过（MUST）：传输层只按"源端口 == 本 socket 端口"过滤，
+    // 拦得住 main 收到的自身组播回环，但拦不住 main 对 Find 的单播应答（源端口
+    // = main 端口，目的端口 = client 临时端口）。若不在 SD 入口整帧剔除，client
+    // 会把本栈自己录成远端实例 → is_available 对自己 true、占住冲突"先到"位，
+    // 并在 TTL 归零后进入 §2 降级单播 Find 自问自答，形成每 period 一次的环路。
+    // 判据与 C/MoonBit 一致：(源地址, 源端口) == (bind_address, port)；
+    // bind_address 为空时退化为"源端口 == port 且源地址 ∈ 本机地址集"。
+    // 该剔除只针对本栈自身通告，"双 socket 共享发现缓存"的设计不变。
+    if (this._isSelfOffer(meta)) return;
     const payload = frame.payload ?? Buffer.alloc(0);
     if (payload.length % 6 !== 0) {
       this.log.warn('sd', `Offer payload not aligned (${payload.length}B), dropped`);

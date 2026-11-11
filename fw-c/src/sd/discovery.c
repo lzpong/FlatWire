@@ -324,6 +324,27 @@ static void transition_found(fw_stack_t *st, fw_disc_rec_t *r) {
 // Offer 处理（周期组播与 Find 单播响应同格式同处理，§7.2）
 // ============================================================
 
+// 自身 Offer 判定：本栈自己发出的 Offer 有两条路可能回灌到本进程：
+//   ① 周期 Offer 组播 → 回环副本按"目的地址+目的端口"只投给 bind udp_port 的 main，
+//      udp.c 的自我过滤（源端口 == 本 socket 端口）在 main 上命中并丢弃；
+//   ② main 对 Find 的单播应答（源端口 = udp_port，目的端口 = client 临时端口）→ 只到 client，
+//      udp.c 的"源端口 == 本 socket 端口"在 client 上不命中（client 端口 ≠ udp_port）故放行。
+// 路径②必须在这里整帧剔除：否则本栈会把自己录进发现缓存 → TTL 归零 → §2 降级单播 Find
+// 自问自答 → 再次 Found，形成每 period 一次的自环，并让 is_available 对自己返回 true、
+// 占住实例冲突检测的先到位。路径①在传输层已拦，两层各管一条路径，互不替代。
+//
+// 判据取 (源地址, 源端口) == (本栈绑定地址, udp_port)：自身 Offer 恒从 udp_port 发出；
+// bind 为空（全接口）时退化为"源端口 == udp_port 且源地址 ∈ 本机地址集"。
+// 该剔除只针对本栈自身通告，不改变 udp.c "双 socket 共享发现缓存"的约定：
+// 其它 socket / 其它本地绑定地址（如同机 127.0.0.2 的独立进程）仍按远端节点处理，冲突检测不变。
+static int is_self_offer(fw_stack_t *st, const fw_meta_t *meta) {
+  if (meta->port != st->cfg.port) return 0; // 自身 Offer 源端口恒为 udp_port
+  if (st->bind[0]) return strcmp(meta->address, st->bind) == 0;
+  for (int i = 0; i < st->nlocal; i++)
+    if (strcmp(st->local_addrs[i], meta->address) == 0) return 1;
+  return 0;
+}
+
 void fw_disc_on_offer(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta) {
   const uint8_t *pl = f->payload;
   uint32_t len = f->payload_len;
@@ -331,6 +352,8 @@ void fw_disc_on_offer(fw_stack_t *st, const fw_frame_t *f, const fw_meta_t *meta
     fw_log(FW_LOG_WARN, "sd", "Offer payload not aligned (%uB), dropped", len);
     return;
   }
+  // 自身 Offer 回环：整帧跳过（一帧内的 Entry 全部来自同一发送节点）
+  if (is_self_offer(st, meta)) return;
   // 接收端全量解码：上限 = 帧内实际 Entry 数（发送端拆帧满装 233/帧，
   // 原 es[64] 硬上限静默丢弃第 65+ 个 Entry，违反 §7.2"逐帧独立处理"；对齐 JS 无上限）
   int cap = (int)(len / FW_ENTRY_OFFER);

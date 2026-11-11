@@ -9,7 +9,7 @@ FlatWire Protocol v5.0 车辆软件 RPC/事件推送协议栈的 Node.js 参考�
 ## 运行
 
 ```powershell
-# 单元测试（99 项：codec / frame / transport / sd-rpc）
+# 单元测试（105 项：codec 32 / frame 44 / transport 16 / sd-rpc 11 / self-offer 2）
 npm test
 
 # 示例（两个终端分别运行；NodeB 空 IDL 库起步，自动 GetIDL 落盘后调用成功）
@@ -18,6 +18,10 @@ node examples/node-b.js          # 客户端：发现 → call → fire_forget �
 ```
 
 示例细节见 `examples/node-a.js` / `examples/node-b.js` 头部注释（支持 `--run-for <ms>` 自动退出与环境变量 `FW_PORT` / `FW_BIND` / `FW_IDL_DIR` / `FW_LOG`）。
+
+**测试脚本写法**：`package.json` 的 `test` 为 `node --test`（自动发现 `test/` 下的用例文件）。不要写成 `node --test test/`——Node 24 起不再接受目录参数，会报 `MODULE_NOT_FOUND`。
+
+**跨栈互通**：仓库根目录 `node scripts/interop.mjs`（本实现免构建，脚本直接运行 `examples/node-a.js` / `examples/node-b.js` 参与六组两两组合）。
 
 ## 目录结构
 
@@ -56,17 +60,18 @@ fw-nodejs/
 | 规范章节 | 内容 | 实现位置 |
 | --- | --- | --- |
 | §2 帧格式/部署 | 8B 帧头、PLB、MSK、组播双 socket、IP_MULTICAST_LOOP | `frame/frame.js`（编码）、`transport/udp.js`（部署） |
-| §3.2~3.7 帧头字段/Code/TYP | CTR/REN/VER/MSK/PLB、TYP 传输类型、Code 码表 | `frame/frame.js` |
+| §3.2~3.7 帧头字段/Code/TYP | CTR/REN/VER/MSK/PLB、TYP 传输类型、Code 码表；**Length 64 位语义**：PLB=0~7、最长 7B 大端（协议上限 2^56−1），本实现按 JS 安全整数 2^53−1 判定上限（超出按实现上限拒绝：UDP 0x23 / TCP 0x00） | `frame/frame.js` |
+| §3.5 IfID 类型分区（SHOULD） | 仅要求 IfID ∈ 0x0001~0xFFFF；`0x0001~0x7FFF` rpc/ff、`0x8000~0xFFFF` event 仅为建议，**不因区间不符拒绝帧或 IDL** | `frame/frame.js` + `codec/schema.js` |
 | §4.1 TCP 流式传输 | 半帧两阶段：帧头不完整→RST(0x26)+关连接；Payload 不完整→RST(0x26)+丢弃模式（R=L−已收精确丢弃，收满恢复，兜底=2×tcp_frame_timeout_ms） | `frame/frame.js`（StreamParser）+ `transport/tcp.js` |
-| §4.3 解析流程 | 十步解析矩阵（MSK=0/VER/REN/TYP/Code/ID/StrmID 语义校验/0x23） | `frame/frame.js`（parseDatagram） |
+| §4.3 解析流程 | 十步解析矩阵（MSK=0/VER/REN/TYP/Code/ID/StrmID 语义校验/0x23）；**TYP=RST 跳过步骤 3/4 的 ID 校验（不区分 CTR）**，数据帧 ACK 不豁免、违规回 RST(0x00) | `frame/frame.js`（parseDatagram） |
 | §4.4 RST | 回显触发帧标识、组播静默 | `frame/frame.js`（makeRst/echoPartial） |
 | §5.1 请求-响应 | Request/Response（OK 0x10）、响应回显 StrmID | `rpc/rpc.js` |
 | §5.2 fire_forget | 无响应调用（TCP/UDP 同为 NON） | `rpc/rpc.js` |
 | §5.3 事件推送 | Notification（UDP NON/CON、TCP NON）、服务端流 0x80~0xFE | `events/events.js` |
 | §5.5 重传与幂等 | CON 重传 0/200/600/1400ms、重复 CON 重发缓存响应/确认 | `rpc/retransmit.js` + `rpc/rpc.js` + `sd/discovery.js` |
-| §5.6 TCP 连接 | 长连接复用、心跳（仅 TCP，30s Ping） | `transport/tcp.js` |
-| §5.7 心跳 | Code=0x00 Ping 不回帧 | `transport/tcp.js` |
-| §6 StrmID | 数据帧 0x01~0xFE；控制帧 0x00/0x01~0x7F 同池；释放冷却 | `strm.js` |
+| §5.6 TCP 连接 | 长连接复用、心跳（仅 TCP，30s Ping）、连接数上限 `max_tcp_connections`（入站/出站**各自独立计数**，超限拒绝） | `transport/tcp.js` |
+| §5.7 心跳 | Code=0x00 Ping 不回帧；失效阈值默认 2×period，可由 `heartbeat_timeout_ms` 直接替换覆盖 | `transport/tcp.js` |
+| §6 StrmID | 数据帧 0x01~0xFE；控制帧 0x00/0x01~0x7F 同池；释放冷却；**池空闲回收**（`strm_pool_idle_ms`） | `strm.js` |
 | §7.1~7.2 SD | 四操作 Entry、Offer 拆帧、Find 响应、GetIDL（仅 TCP、落盘持久化、双角色统一触发、启动 Find 预热） | `sd/entries.js` + `sd/discovery.js` + `idlstore/store.js` |
 | §7.4~7.5 状态机/TTL | Unknown→Found→Subscribed→Expired；订阅/发现 TTL tick；自动重订阅 | `sd/discovery.js` |
 | §8 订阅管理 | Subscribe(CON/NON)、ACK(0x10)/ACK(0x00)、全量推送、tcp-event 预建连接、逐 Entry 处理 | `sd/discovery.js` + `events/events.js` |
@@ -75,6 +80,7 @@ fw-nodejs/
 | §11.1 IDL | 纯动态加载、type_def 顶层、transport 绑定、事件组 | `codec/schema.js` + `idlstore/store.js` |
 | §12 错误码 | 两层两码：帧级 0x23（仅 UDP）/IDL 级 0x20；RST 码表 | `errors.js` + 各模块 |
 | §13 应用 API | register_service/call/fire_forget/notify/subscribe/find_service 等 | `stack.js` |
+| §12.6 发送背压（实现限制） | 数据帧有界队列（单连接 256KB / 全栈 64MB）、控制帧直写（≤1024B 不占配额，阈值为常量不可配置）、满即拒写且一字节不写、持续满 2×心跳周期断连；全栈预算为 **O(1) 增量计数** `TcpTransport.sendqBytes`（测试可开 `checkSendqAccounting` 对账） | `transport/tcp.js` |
 | §3.6 生命周期 | stop 发 REN×3（间隔 100ms）先发后关；REN 清缓存/重传记录/StrmID 序列 | `stack.js` + `sd/discovery.js` + `rpc/rpc.js` + `events/events.js` |
 | 附录 A 参数 | 全部配置项默认值（时间单位 ms） | `stack.js`（DEFAULT_CONFIG） |
 
@@ -89,7 +95,10 @@ fw-nodejs/
 | `retransmit_interval_ms` / `retransmit_max` | 200 / 3 | CON 重传间隔/次数（0/200/600/1400ms） |
 | `tcp_frame_timeout_ms` | 5000 | TCP 半帧超时（丢弃模式兜底 = 2×） |
 | `heartbeat_period_ms` | 30000 | TCP 心跳周期（仅 TCP） |
-| `max_payload_len` | 1400 | UDP 帧级 Payload 上限（超限 → RST(0x23)） |
+| `heartbeat_timeout_ms` | `null` | 心跳失效阈值覆盖项；`null` = 2×`heartbeat_period_ms`，非空时**直接替换**该阈值（不取 min） |
+| `max_tcp_connections` | 1024 | TCP 连接数上限（服务端/客户端**各自独立**计数，超限拒绝新连接） |
+| `strm_pool_idle_ms` | 300000 | Strm 池空闲回收阈值（0 = 不回收） |
+| `max_payload_len` | 1400 | UDP 帧级 Payload 上限（超限 → RST(0x23)）；TCP 不受此项限制 |
 | `ver` | 0 | 协议版本 VER（不匹配 → RST(0x22)） |
 | `idl_dir` | ./idl | IDL 库文件夹（`{svc_id}_v{major_ver}.json`） |
 | `tcp_enabled` | true | TCP 监听开关（同机双栈演示时客户端角色栈关闭） |
@@ -110,15 +119,17 @@ fw-nodejs/
 6. **Subscribe 单 Entry RST(0x24) 调和**（6.17/6.19）：单 Entry 帧指向本地完全不存在 (svc,inst) → RST(0x24)；多 Entry 帧逐 Entry 丢弃仍回确认（§7.2 Entry 级处理）。
 7. **自我回环过滤**：指定 `bind_address` 时按该地址过滤本 socket 回环帧；未指定时按全部本机 IPv4 地址。同机双栈演示利用 127/8 多回环地址（A=127.0.0.1 / B=127.0.0.2）+ 共用端口避免 Windows 同端口单播投递竞争。
 8. **接口级 `crc` 字段**：IDL 接口可声明 `"crc": true` 启用接口级 CRC（§9.6「CRC 作为服务契约约定」的实现落点）；省略 = 不启用。
-9. **发送背压与 `TcpConn.write` 语义收紧**（§12.6 实现限制，非协议语义）：数据帧（帧总长 >1024B 或 CTR=0）写入前检查单连接水位（`socket.writableLength`）与全栈预算，满则**不调用 `socket.write`、不写入任何字节**并返回 `false`；控制帧（RST/Ping/GetIDL 请求，CTR=1 且总长 ≤1024B）直写不入队、不占配额。**注意：这与旧实现不同**——旧实现直接返回 `socket.write()` 的 boolean（`false` 仅表示缓冲超过 highWaterMark，帧仍被写入）。调用方必须把 `false` 当作「未写入」处理：rpc 客户端请求回滚 `_pending` 与 StrmID，`fire_forget` 释放 StrmID，其余推送/响应按丢弃 + 计数 + 日志处理。队列自首次拒写起持续满 ≥ 2×`heartbeat_period_ms` 则断连。观测量（`TcpConn.qBytes/qPeak/qRejects`、`TcpTransport.sendqPeak/sendqRejects/sendqClosedFull`）本轮仅内部统计 + 日志，未提供公开 API。
+9. **发送背压与 `TcpConn.write` 语义收紧**（§12.6 实现限制，非协议语义）：数据帧（帧总长 >1024B 或 CTR=0）写入前检查单连接水位（`socket.writableLength`）与**全栈预算**，满则**不调用 `socket.write`、不写入任何字节**并返回 `false`；控制帧（RST/Ping/GetIDL 请求，CTR=1 且总长 ≤1024B）直写不入队、不占配额。**注意：这与旧实现不同**——旧实现直接返回 `socket.write()` 的 boolean（`false` 仅表示缓冲超过 highWaterMark，帧仍被写入）。调用方必须把 `false` 当作「未写入」处理：rpc 客户端请求回滚 `_pending` 与 StrmID，`fire_forget` 释放 StrmID，其余推送/响应按丢弃 + 计数 + 日志处理。队列自首次拒写起持续满 ≥ 2×`heartbeat_period_ms` 则断连。观测量（`TcpConn.qBytes/qPeak/qRejects`、`TcpTransport.sendqPeak/sendqRejects/sendqClosedFull`）本轮仅内部统计 + 日志，未提供公开 API。
+10. **全栈预算为 O(1) 增量计数**（§12.6）：判定不再遍历所有连接求和 `writableLength`，改为 `TcpTransport.sendqBytes` + 每连接 `qData`（数据帧入队加 / `drain` 归还 / 连接关闭扣减残留）。记账与水位分桶：`qData` 计入预算、`qCtrl` 只用于对账（控制帧直写不占配额）。测试开关 `checkSendqAccounting: true` 会在每次入队/`drain`/关闭扣减后与遍历求和比对（含控制桶、扣除部分 flush 的滞后量），漂移立即抛错；生产默认关闭。水位来源仍为 `socket.writableLength`（含控制帧字节），与 C 的独立队列计数不同——判定口径已通过分桶对齐，仅观测量来源保留差异（见设计 §12.6）。
 
 ## 测试
 
-`npm test` 运行 99 项单元测试（`node:test`，对齐《Test Cases.v5.md》用例编号）：
+`npm test` 运行 105 项单元测试（`node:test`，对齐《Test Cases.v5.md》用例编号）：
 
 - **codec（32）**：CRC 自检值 0x29B1、§1 裸字节编解码（1.5~1.38：强制长度声明/bool 严格/恒定宽度/值域/float/timestamp/前缀宽度/定长与变长/嵌套/enum/CRC 缺省与开启/末尾字段忽略/大端）、MSK-XOR
-- **frame（42）**：§4.3 解析矩阵（非法组合 → 正确 RST Code）、RST 回显形态、TCP 流式粘包/分包/半帧两阶段/丢弃模式兜底（含 1200 帧粘包、MSK 帧、大帧分片）
-- **transport（14）**：TCP 粘包/分包/跨包、半帧两阶段全场景（精确丢弃/恢复/EOF/反向 RST 不污染正向流）、心跳超时临界、连接上限与句柄回收、**发送背压 BP-1/BP-2（真实 socket 拥塞：对端不读 + 大帧）**
+- **frame（44）**：§4.3 解析矩阵（非法组合 → 正确 RST Code）、RST 回显形态、TCP 流式粘包/分包/半帧两阶段/丢弃模式兜底（含 1200 帧粘包、MSK 帧、大帧分片）、§3.2 Length 64 位与实现承载分界（2^53−1 通过 / 2^53 拒绝、违规帧定界 total 溢出 → abandoned）
+- **transport（16）**：TCP 粘包/分包/跨包、半帧两阶段全场景（精确丢弃/恢复/EOF/反向 RST 不污染正向流）、心跳超时临界、连接上限与句柄回收、**发送背压 BP-1/BP-2（真实 socket 拥塞：对端不读 + 大帧）**、**BP-4 全栈预算分支（budget=1.5×单连接上限：c1 打满 260850B 后 c2 在自身约 131KB 即被 `stack budget` 拒写；控制帧直写后计数与遍历求和对账一致；关闭后同为 0）**、**5.38 自身 Offer 跳过（传输层过滤：源端口 == 本 socket 端口的回环帧丢弃，另一 socket 回环与远端同端口帧放行）**
 - **sd-rpc（11）**：重传时间线 200/600/1400ms、响应缓存去重、双栈真实回环集成（发现/GetIDL 拉取落盘/调用往返/订阅确认链路/事件推送/全量推送/取消确认/REN 清缓存）、**BP-3 写失败回滚（call 清 pending + 释放 StrmID；fire_forget 释放 StrmID）**
+- **self-offer（2）**：**5.38 真实栈自身 Offer**——单栈 `start+register_service` 观测 client socket 确实收到 main 对 Find 的单播应答（源端口 = `port`），但发现缓存为空、`is_available` 对自己 false、连续 Find 均超时且无额外周期 Find；双栈同端口不同 bind 验证远端 Offer 正常入库、不误杀
 
 集成冒烟（`examples/` 双进程真实回环）已验证：发现 → 空 IDL 库自动 GetIDL 落盘 → rpc 往返（含 fixed_len=20 定长串与 max_len 变长串）→ fire_forget → 订阅确认 ACK(0x10) → 全量推送/实时推送 → 服务端优雅退出（REN×3）→ 客户端感知缓存清空 → 服务端重启后重新发现。

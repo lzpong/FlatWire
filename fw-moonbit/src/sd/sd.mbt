@@ -521,6 +521,12 @@ fn Sd::send_rst_udp(
 
 /// 处理 Offer（§7.2 实例冲突处理 + §7.5 TTL 重置）
 fn Sd::handle_offer(self : Sd, payload : Bytes, host : String, port : Int) -> Unit {
+  // §7.2 自身 Offer 必须跳过：组播回环（或单播回显）会把本栈自己录成"远端实例"，
+  // 造成 is_available 对自己返回 true、占住实例冲突"先到"位置等副作用。整帧忽略，
+  // 不入发现缓存、不计 TTL。判据见 Transport::is_self_source（双 socket 共享缓存设计不变）。
+  if self.transport.is_self_source(host, port) {
+    return
+  }
   match parse_offer_entries(payload) {
     None => () // 整帧无法解析：周期 Offer 重发兜底，静默（保守原则）
     Some(entries) =>

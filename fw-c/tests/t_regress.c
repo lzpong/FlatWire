@@ -804,6 +804,57 @@ static int test_merged_sub_invalid_entry(void) {
 }
 
 // ============================================================
+// 11. [5.38] 自身 Offer：单栈 start+register 后自身单播应答不得入库
+//
+// 覆盖真实链路（不是进程内直接调 fw_disc_on_offer）：
+//   start 从 client socket 发启动 Find（源 = client 临时端口）
+//   → poll 时 main 收到并匹配本栈刚注册的实例 → 单播 Offer 回 client
+//   → udp.c 只按"源端口 == 本 socket 端口"过滤，client 端口 ≠ udp_port 故放行
+//   → fw_disc_on_offer 的 is_self_offer 必须整帧剔除。
+// 若不剔除：自身条目入缓存 → is_available 对自己 true → TTL 归零 → §2 降级
+// 单播 Find 自问自答 → 重新入缓存，形成每 period 一次的自环。
+// ============================================================
+
+static int test_self_offer(void) {
+  TEST_BEGIN("5.38 自身 Offer：单栈 start+register 后发现缓存无自身、is_available 对自己 false、无降级 Find 自环");
+  fw_config_t ca;
+  fw_config_defaults(&ca);
+  ca.port = PORT_SUB + 5;
+  ca.bind_address = "127.0.0.1";
+  ca.period_ms = 200;
+  ca.ttl_ms = 1000;
+  ca.idl_dir = IDL_DIR_A;
+  ca.log_level = FW_LOG_ERROR;
+  fw_stack_t *a = NULL;
+  CHECK_EQ_INT(fw_stack_init(&a, &ca), FW_OK);
+  CHECK_EQ_INT(fw_stack_start(a), FW_OK);
+  fw_handlers_t h;
+  memset(&h, 0, sizeof(h));
+  h.on_request = on_request;
+  CHECK_EQ_INT(fw_register_service(a, 5100, 1, IDL_TEXT, &h), FW_OK);
+  // 单栈不应有任何远端发现，注册本身也不得把自己录进客户端缓存
+  CHECK_EQ_INT(a->disc.ndisc, 0);
+
+  // 跑 2.5s：覆盖启动 Find 单播应答（首个 poll 即到达）、多个周期 Offer、
+  // 1s TTL tick 与 2 次 §2 降级窗口（2200ms），足以暴露自环
+  int avail_seen = 0;
+  int64_t dl = fw_now_ms() + 2500;
+  while (fw_now_ms() < dl) {
+    fw_stack_poll(a, 5);
+    if (fw_is_available(a, 5100, 1)) { avail_seen = 1; break; } // 全程对自己不可用
+  }
+  CHECK_EQ_INT(avail_seen, 0);
+  // 修复前：自身条目持续存在（或降级 Find 反复重建），ndisc 恒为 1
+  CHECK_EQ_INT(a->disc.ndisc, 0);
+  CHECK_EQ_INT(a->disc.npf, 0); // 无待决 Find（自环的附带产物）
+
+  fw_stack_stop(a);
+  fw_stack_free(a);
+  TEST_END();
+  return 0;
+}
+
+// ============================================================
 
 // 清空 IDL 目录内全部 .json（测试前置：消除上一轮运行残留对断言的影响）
 static void clear_idl_dir(const char *dir) {
@@ -834,5 +885,6 @@ int suite_regress(void) {
   fails += test_sub_ack_no_cache();
   fails += test_dup_con_no_repush();
   fails += test_merged_sub_invalid_entry();
+  fails += test_self_offer();
   return fails;
 }

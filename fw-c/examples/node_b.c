@@ -50,6 +50,9 @@ static int wait_avail(fw_stack_t *st, uint16_t svc, uint8_t inst, int timeout_ms
 }
 
 int main(int argc, char **argv) {
+  // stdout 无缓冲：重定向到管道时保持逐行实时可见（VERIFY 标记与超时诊断依赖实时输出；
+  // MSVC CRT 的 _IOLBF 对管道不生效，故用 _IONBF）
+  setvbuf(stdout, NULL, _IONBF, 0);
   unsigned port = argc > 1 ? (unsigned)atoi(argv[1]) : 5400;
   const char *bind = argc > 2 ? argv[2] : "127.0.0.2";
 

@@ -17,7 +17,9 @@ FlatWire Protocol（FW）是一个**扁平化、契约驱动、轻量**的应用
 - **IDL 驱动 + 纯动态架构**：JSON 格式 IDL 定义服务契约（接口、类型、传输绑定、版本）；协议栈**不内置 IDL、无代码生成、无 Stub**——服务定义运行时从 IDL 库加载（支持 GetIDL 按需拉取落盘），编解码由协议栈按已加载 IDL 动态执行，含明确的**服务版本兼容规则**。
 - **裸字节类型系统**（v5.0）：`u8/u16/u32/u64`、`i8/i16/i32/i64`、`f32/f64`、`bool`、`timestamp`、`enum`、`string / bytes / array`，字段按 IDL 顺序**裸值大端连续编码**（无字段头、无类型标记），支持任意层级嵌套（结构体、数组、多维数组）。
 - **载荷掩码（MSK）**：可选 4 字节 XOR 掩码，规避中间设备对载荷的误识别（注意：仅为混淆，**非加密机制**）。
-- **面向受限环境**：默认 `max_payload_len = 1400`，协议栈不提供分块重组（大数据走 TCP 接口），资源占用可控。
+- **Length 64 位语义**：`PLB` 取 0\~7，最长 7 字节大端 `Payload Length`，协议上限 2^56−1；各实现可设更低的实际承载上限，但**不得截断 Length 解析宽度**（见下"实现承载上限"）。
+- **面向受限环境**：UDP 默认 `max_payload_len = 1400`，协议栈不提供分块重组（大数据走 TCP 接口），资源占用可控；TCP 无 `max_payload_len` 限制，单帧仅受协议上限与 IDL `max_payload`/`max_len` 约束。
+- **发送背压（实现限制，非协议语义）**：TCP 数据帧走有界发送队列（单连接 256KB / 全栈 64MB），控制帧（RST/Ping/GetIDL 请求，CTR=1 且帧总长 ≤1024B）直写不入队；队列满时该帧**一字节不写**并返回"不可写"，调用方负责回滚/重试；自首次拒写持续满 2×`heartbeat_period_ms` 主动断连。
 
 ***
 
@@ -30,6 +32,7 @@ FlatWire Protocol（FW）是一个**扁平化、契约驱动、轻量**的应用
 | 双角色节点 | 节点可同时作服务端与客户端，两套状态独立维护 |
 | 契约驱动 | 服务注册后自动广播 Offer；接口集合由 IDL 定义（纯动态运行时加载） |
 | 裸字节编码 | 字段按 IDL 顺序裸值连续编码：无字段头、无类型标记、无结构边界（v5.0） |
+| IfID 分区仅建议 | 建议 `0x0001~0x7FFF` 用于 rpc/ff、`0x8000~0xFFFF` 用于 event（SHOULD）；实现**不得**因 IfID 落在另一区间而拒绝帧或拒绝加载 IDL，只要求 IfID ∈ `0x0001~0xFFFF` |
 | 可信网络假设 | 协议层不提供安全保证，安全由环境层（封闭网络 / VPN / 链路加密）提供 |
 
 ***
@@ -92,10 +95,64 @@ flatwire-protocol/
 ├── docs/
 │   ├── FlatWire Protocol (FW) Design.v5.md       # 当前规范（裸字节编码）
 │   └── FlatWire Protocol (FW) Test Cases.v5.md   # 一致性测试基准
+├── scripts/
+│   └── interop.mjs          # 跨栈互通编排（六组两两组合，Windows/Linux 通用）
 ├── fw-nodejs/               # JavaScript/Node.js 实现（零依赖 ESM）
 ├── fw-moonbit/              # MoonBit 实现（JS 后端）
 └── fw-c/                    # C11 实现（CMake 跨平台，零依赖）
 ```
+
+***
+
+## 实现状态
+
+### 实现层资源上限（非协议语义，可配置）
+
+| 项 | 默认 | fw-c | fw-nodejs | fw-moonbit |
+| --- | --- | --- | --- | --- |
+| 单连接发送队列 | 256KB | `max_send_queue_bytes` | `max_send_queue_bytes` | `__fw.q.connMax` |
+| 全栈发送预算 | 64MB | `send_queue_budget_bytes` | `send_queue_budget_bytes` | `__fw.q.budget` |
+| TCP 连接数上限 | 1024 | `max_conns`（入/出站统一计数） | `max_tcp_connections`（每侧独立） | **未实现**（不限制） |
+| Strm 池空闲回收 | 300s | `strm_pool_idle_ms` | `strm_pool_idle_ms` | **未实现** |
+| 心跳失效阈值 | 2×period | 固定 2×period | `heartbeat_timeout_ms` 可替换 | 固定 2×period |
+
+### 解析约定（三栈一致）
+
+- **TYP=RST 豁免步骤 3/4 的 ID 校验**：RST 的 `SvcID/IfID/InstID/StrmID` 是回显字段，取值来自触发帧，可能越界；接收方解析**任何** TYP=RST 帧时都跳过 §4.3 步骤 3/4，**不区分 CTR**（RST 自身也可能是数据帧）。RST 的形态与 Code 值域仍在步骤 2 校验。若仍校验会形成"RST 判违规 → 回 RST → 对端再判违规"的回环风暴。
+- **数据帧 ACK 不豁免**：ACK 的回显 ID 必须落在合法范围，仍执行步骤 3/4，违规回 RST(0x00)。控制帧 ACK(Code=0x00) 回显会话 StrmID 是步骤 4 的明文例外。
+
+### 实现承载上限（协议上限 2^56−1）
+
+| 实现 | 单帧实际承载上限 | 依据 |
+| --- | --- | --- |
+| fw-c | 2^32−1（交付结构 `payload_len` 为 uint32；解析/丢弃计数按 64 位） | 64 位平台上解析器可完整表示 2^56−1 |
+| fw-nodejs | 2^53−1（JS 安全整数，超出按实现上限拒绝：UDP 0x23 / TCP 0x00）；实际分配另受 `Buffer` 上限约束 | JS `Number` 精确整数范围 |
+| fw-moonbit | 无显式单帧上限（TCP 按声明长度缓冲，实际受 JS 数组/内存约束）；Length 声明与丢弃计数按 `Int64` 计算，UDP 先经 Int64 比较再转 Int 交付 | `frame/parse.mbt` + `frame/tcp.mbt` |
+
+### 测试命令与数字（本机实测）
+
+| 实现 | 命令 | 数字 |
+| --- | --- | --- |
+| fw-c | `cmake -B build -G Ninja && cmake --build build && ctest --test-dir build`（或 `build\fw_tests.exe`） | 12 个套件 / 99 项用例，全部通过 |
+| fw-nodejs | `npm test`（`node --test`） | 105 项：codec 32 / frame 44 / transport 16 / sd-rpc 11 / self-offer 2，全部通过 |
+| fw-moonbit | `moon test --target js` | 138 项，全部通过；背压实测 `moon run examples/bp_probe --target js` |
+
+### 跨栈互通自动化（`scripts/interop.mjs`）
+
+验证三套实现在**不同语言之间**仍可互通（单栈单测覆盖不到该维度）。
+
+```powershell
+# 前置构建（Node 免构建）
+cmake --build fw-c/build --config Release --target fw_node_a fw_node_b
+cd fw-moonbit; moon build --target js; cd ..
+
+# 六组两两组合：C/Node/MoonBit 分别作 A 与 B
+node scripts/interop.mjs
+```
+
+- 每组独立 `FW_PORT`（5450 起，组间 +2），A 绑 `127.0.0.1`、B 绑 `127.0.0.2`（同机同端口不能绑同一回环地址），B 的 `FW_IDL_DIR` 指向空目录以强制 GetIDL 拉取。
+- 判定口径：B 退出码 0 且 `[VERIFY-1]`~`[VERIFY-5]` 齐全；A 必须由 `--run-for` **自然退出**（非强杀），以验证优雅退出（REN×3）不留脏进程。
+- 超时兜底：等待 A 输出 `stack started` 25s、B 45s；超时清理整棵子进程树并判该组失败。日志在 `tmp/interop/<组>/`。
 
 ***
 
@@ -109,7 +166,7 @@ flatwire-protocol/
     - 事件推送 / Notifier（§8）
     - 结构化数据字段与类型系统（§9）
     - IDL 语法与版本兼容（§11）
-    - 错误码与恢复策略（§12）
+    - 错误码与恢复策略（§12，含 §12.6 发送背压等实现限制）
     - 公共 API 契约（§13）
     - 配置参数与术语对照表（附录 A / B）
 
@@ -122,7 +179,8 @@ flatwire-protocol/
 - [x] 协议规范 v5.0（裸字节编码：无字段头；帧格式、SD、Notifier、IDL、错误码）
 - [ ] IDL 工具链（生成编解码 / Stub / 传输绑定）——纯动态架构下不需要代码生成
 - [x] 参考实现（fw-nodejs / fw-moonbit / fw-c 三语言协议栈）
-- [x] 一致性测试套件（三实现单测 + 跨栈互通）
+- [x] 一致性测试套件（三实现单测，用例编号对齐 Test Cases.v5.md：C 99 / Node 105 / MoonBit 138）
+- [x] 跨栈互通自动化（`scripts/interop.mjs`：六组两两组合，B 退出码 + VERIFY 标记 + A 自然退出三重判定）
 - [ ] 多语言绑定
 
 ***

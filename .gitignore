@@ -4,7 +4,11 @@ fw-nodejs/build/
 fw-moonbit/build/
 fw-moonbit/_build/
 *.o
+*.exe
 .old
 .vscode/
 .vs/
 .trae/
+# 互通脚本运行产物（scripts/interop.mjs）：日志与示例 IDL 缓存
+tmp/
+.idl-*/

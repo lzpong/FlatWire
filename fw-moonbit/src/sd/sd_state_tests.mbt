@@ -1,14 +1,19 @@
-﻿﻿// SD 状态机 inline 测试（同包访问 priv 字段：发现缓存 / 服务端订阅表 / tick 推进）
+﻿﻿﻿﻿// SD 状态机 inline 测试（同包访问 priv 字段：发现缓存 / 服务端订阅表 / tick 推进）
 //
 // Transport::new / IdlStore::new / CtrlStrmPool::new 均为纯构造（无 FFI 副作用），
 // tick 与收包处理不涉及真实网络——状态迁移可在 moon test 环境完整验证
 
 /// 构造测试用 Sd（事件捕获到数组）
 fn make_sd(events : Array[SdEvent]) -> Sd {
+  make_sd_bind(events, "")
+}
+
+/// 构造测试用 Sd（指定 bind_address；用于 §5.38 自身 Offer 判据的精确分支）
+fn make_sd_bind(events : Array[SdEvent], bind : String) -> Sd {
   let tcfg : @transport.TransportConfig = {
     udp_port: 5400,
     tcp_port: 5400, // §2 TCP/UDP 共用端口 5400（规范 §2）
-    bind_address: "",
+    bind_address: bind,
     tcp_enabled: true,
     local_ver: 0,
     max_payload_len: 1400,
@@ -89,35 +94,37 @@ test "server sub tick expiry" {
 test "handle offer update cache" {
   let events : Array[SdEvent] = []
   let sd = make_sd(events)
+  // 源用 10.0.0.1 而非 127.0.0.1：后者:5400 已属"自身 Offer"（§7.2），会在入口整帧跳过，
+  // 本用例只验证缓存维护逻辑，故取非本机地址
   // 新实例 Found
   sd.handle_offer(
     encode_offer_entries([{ svc_id: 4096, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 4 }]),
-    "127.0.0.1",
+    "10.0.0.1",
     5400,
   )
   assert_eq(sd.is_available(4096, 1), true)
-  assert_eq(sd.discover.get("4096|1|127.0.0.1").unwrap().ttl_remaining, 4)
+  assert_eq(sd.discover.get("4096|1|10.0.0.1").unwrap().ttl_remaining, 4)
   // 同源刷新：TTL 重置非累加
   sd.handle_offer(
     encode_offer_entries([{ svc_id: 4096, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 3 }]),
-    "127.0.0.1",
+    "10.0.0.1",
     5400,
   )
-  assert_eq(sd.discover.get("4096|1|127.0.0.1").unwrap().ttl_remaining, 3)
+  assert_eq(sd.discover.get("4096|1|10.0.0.1").unwrap().ttl_remaining, 3)
   // TTL=0 → 标记待移除（未删除）
   sd.handle_offer(
     encode_offer_entries([{ svc_id: 4096, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 0 }]),
-    "127.0.0.1",
+    "10.0.0.1",
     5400,
   )
-  assert_eq(sd.discover.get("4096|1|127.0.0.1").unwrap().expired, true)
+  assert_eq(sd.discover.get("4096|1|10.0.0.1").unwrap().expired, true)
   // tick 后删除
   sd.tick()
-  assert_eq(sd.discover.get("4096|1|127.0.0.1") is None, true)
+  assert_eq(sd.discover.get("4096|1|10.0.0.1") is None, true)
   // SvcID=0 丢弃
   sd.handle_offer(
     encode_offer_entries([{ svc_id: 0, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 4 }]),
-    "127.0.0.1",
+    "10.0.0.1",
     5400,
   )
   assert_eq(sd.discover.length(), 0)
@@ -295,4 +302,46 @@ test "getidl req server reply" {
   let f3 : @frame.Frame = { ..f1, strm_id: 79, payload: b"\x10\x00" }
   sd.handle_getidl_req(f3, 79, "10.0.0.1", 5400)
   assert_eq(events.length(), 0)
+}
+
+/// §5.38 / 设计 §7.2：自身 Offer 必须整帧跳过（bind 为空 → 退化判据）
+///
+/// 真实路径是 main 对 Find 的单播应答（源端口 = udp_port，目的端口 = client 临时端口）：
+/// 传输层按"源端口 == 本 socket 端口"不命中（client 端口 ≠ udp_port），落到 SD 入口。
+/// 若不在 SD 入口剔除，本栈会把自身录成远端实例。
+test "5.38 self offer skipped (wildcard bind)" {
+  let events : Array[SdEvent] = []
+  let sd = make_sd(events) // bind_address="" → 源端口==5400 且源地址∈本机地址集
+  let payload = encode_offer_entries([
+    { svc_id: 4096, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 4 },
+  ])
+  // 自身：(127.0.0.1, 5400)（main 单播应答来源）→ 不入缓存
+  sd.handle_offer(payload, "127.0.0.1", 5400)
+  assert_eq(sd.is_available(4096, 1), false)
+  assert_eq(sd.discover.length(), 0)
+  // 非本机地址、同端口 → 按远端节点处理
+  sd.handle_offer(payload, "10.1.2.3", 5400)
+  assert_eq(sd.is_available(4096, 1), true)
+}
+
+/// §5.38 / 设计 §7.2：bind_address 非空时仅 (bind, udp_port) 视为自身
+///
+/// 同端口不同绑定地址（同机 127.0.0.2 上的另一独立进程）必须仍按远端处理，
+/// 否则会误伤同机多进程部署与实例冲突检测。
+test "5.38 self offer skipped (exact bind)" {
+  let events : Array[SdEvent] = []
+  let sd = make_sd_bind(events, "127.0.0.1")
+  let payload = encode_offer_entries([
+    { svc_id: 4096, inst_id: 1, major_ver: 1, minor_ver: 0, ttl: 4 },
+  ])
+  // 自身：(127.0.0.1, 5400) → 跳过
+  sd.handle_offer(payload, "127.0.0.1", 5400)
+  assert_eq(sd.discover.length(), 0)
+  assert_eq(sd.is_available(4096, 1), false)
+  // 同端口不同地址 → 远端
+  sd.handle_offer(payload, "127.0.0.2", 5400)
+  assert_eq(sd.is_available(4096, 1), true)
+  // 自绑定地址但源端口不同（非自身 announcer）→ 远端
+  sd.handle_offer(payload, "127.0.0.1", 6000)
+  assert_eq(sd.discover.length(), 2)
 }

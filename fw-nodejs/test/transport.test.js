@@ -9,6 +9,7 @@ import net from 'node:net';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { TcpTransport, TcpConn } from '../src/transport/tcp.js';
+import { UdpTransport } from '../src/transport/udp.js';
 import { TYP, CODE, encodeFrame, makeRst, parseDatagram } from '../src/frame/frame.js';
 import { RST_CODE } from '../src/errors.js';
 
@@ -595,4 +596,33 @@ test('BP-4(Node) 全栈预算分支：O(1) 增量计数触发、计数与遍历�
     await t.stop();
   }
 }, { timeout: 20000 });
+
+// ============================================================
+// §5.38 / 设计 §7.2：自身 Offer 必须跳过
+// Node 的过滤点在传输层（udp.js _onMessage）：源 IP ∈ 本 socket 地址集
+// 且源端口 == 本 socket 端口 → 丢弃（自身组播回环）；另一 socket 的回环帧不过滤，
+// 「双角色同栈共享发现缓存」的设计保持不变。
+// ============================================================
+test('5.38 自身端口的组播回环帧在传输层被丢弃（§7.2 自身 Offer 跳过）', () => {
+  const t = new UdpTransport({ port: 45500, bindHost: '127.0.0.1', logger: BP_LOGGER });
+  const got = [];
+  t.on('frame', (f, meta) => got.push(meta));
+  // 1×Offer Entry（6B）：SvcID=4096 InstID=1 MajorVer=1 MinorVer=0 TTL=4
+  // 控制帧头 ID 必须全 0（§4.3 步骤 3/4），SvcID 在 Payload Entry 内
+  const offer = encodeFrame({
+    ctr: 1, typ: TYP.CON, code: CODE.SD_OFFER,
+    svc_id: 0, if_id: 0, inst_id: 0, strm_id: 0,
+    payload: Buffer.from([0x10, 0x00, 0x01, 0x01, 0x00, 0x04]),
+  });
+  const mainSock = { address: () => ({ address: '127.0.0.1', port: 45500 }) };
+  // ① 自身 main socket 发出的 Offer 回环（源端口 == main 端口）→ 丢弃，不建自身条目
+  t._onMessage(mainSock, offer, { address: '127.0.0.1', port: 45500 }, 'main');
+  assert.equal(got.length, 0);
+  // ② 同机 client socket 临时端口的回环 → 放行（双 socket 共享发现缓存不变）
+  t._onMessage(mainSock, offer, { address: '127.0.0.1', port: 60123 }, 'client');
+  assert.equal(got.length, 1);
+  // ③ 同端口但非本机地址（真实远端节点）→ 放行
+  t._onMessage(mainSock, offer, { address: '10.1.2.3', port: 45500 }, 'main');
+  assert.equal(got.length, 2);
+});
 

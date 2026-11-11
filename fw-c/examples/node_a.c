@@ -7,8 +7,9 @@
 //   - 周期 notify StateChanged(32769) / PowerModeChanged(32770)
 //   - 优雅退出（stop 发 REN×3 组播，§3.6）：--run-for <ms> 到期或 Ctrl+C
 //
-// 运行：fw_node_a [port] [bind]
+// 运行：fw_node_a [port] [bind] [--run-for <ms>]
 //   port 默认 5400；bind 默认 127.0.0.1（同机演示）
+//   --run-for 到期后优雅退出（便于跨栈互通脚本收尾，不留脏进程）
 // ============================================================
 
 #include "fw/fw.h"
@@ -78,8 +79,25 @@ static void on_fire_forget(void *ud, uint16_t if_id, const fw_value_t *payload) 
 }
 
 int main(int argc, char **argv) {
-  unsigned port = argc > 1 ? (unsigned)atoi(argv[1]) : 5400;
-  const char *bind = argc > 2 ? argv[2] : "127.0.0.1";
+  // stdout 无缓冲：重定向到管道/文件时 MSVC CRT 的 _IOLBF 仍按全缓冲处理，
+  // 会让 "stack started" 迟迟不落地，依赖该行做就绪判定的编排脚本（scripts/interop.mjs）会误判
+  setvbuf(stdout, NULL, _IONBF, 0);
+  unsigned port = 5400;
+  const char *bind = "127.0.0.1";
+  long long run_for_ms = 0;
+  // 参数：位置参数 [port] [bind]（按出现顺序）+ 可选 --run-for <ms>（任意位置）
+  int pos = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--run-for") == 0 && i + 1 < argc) {
+      run_for_ms = atoll(argv[++i]);
+    } else if (pos == 0) {
+      port = (unsigned)atoi(argv[i]);
+      pos = 1;
+    } else if (pos == 1) {
+      bind = argv[i];
+      pos = 2;
+    }
+  }
 
   // 读取 IDL（examples/vehicle-state.idl.json）
   char idl[16384];
@@ -128,7 +146,9 @@ int main(int argc, char **argv) {
   // 周期事件推送：StateChanged(32769) + PowerModeChanged(32770, enum=2 Run)
   int seq = 0;
   int64_t last_push = fw_now_ms();
+  const int64_t deadline = run_for_ms > 0 ? fw_now_ms() + run_for_ms : 0;
   while (g_run) {
+    if (deadline > 0 && fw_now_ms() >= deadline) break; // --run-for 到期
     fw_stack_poll(g_stack, 50);
     if (fw_now_ms() - last_push >= 2000) {
       last_push = fw_now_ms();
